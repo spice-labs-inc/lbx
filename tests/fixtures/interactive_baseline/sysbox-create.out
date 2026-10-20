@@ -1,0 +1,6 @@
+==> Creating new container 's1' (sysbox) ...
+    (granting NET_ADMIN + /dev/net/tun — sysbox runtime; enables
+     bridged VM networking.)
+
+  Welcome to llm in a box... where agents are constrained
+

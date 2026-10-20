@@ -1,0 +1,8 @@
+bin.name = "lbx"
+args = []
+status.code = 1
+stdout = ""
+[env.add]
+HOME = "/nonexistent-home"
+LLMBOX_STATE_DIR = "/nonexistent-state"
+LLMBOX_CONFIG = "/nonexistent-config"

@@ -1,0 +1,5 @@
+---
+source: tests/contract.rs
+expression: run_line
+---
+run -d --privileged --name fresh --hostname fresh --label llm-in-a-box.runtime=docker --label llm-in-a-box.user=agent -e HOST_USER=[USER] -e HOST_UID=[UID] -e HOST_GID=[GID] -v [ROOT]/cwd:/data -v fresh-docker:/var/lib/docker llm-in-a-box:docker

@@ -1,0 +1,4 @@
+bin.name = "lbx"
+args = ["--run", "--timeout"]
+status.code = 125
+stdout = ""

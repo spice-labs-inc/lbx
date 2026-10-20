@@ -1,0 +1,481 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# build — build llm-in-a-box image(s) for a runtime, plus the vm base disk.
+#
+# Usage:  ./build <sysbox|docker|vm|relay|all> [--check]
+#         ./build relay [--label KEY=VALUE]...
+#
+#   sysbox   Build image for sysbox (requires docker)
+#   docker   Build image for plain Docker (requires docker)
+#   vm       Build image for the KVM VM runtime AND the bootable base disk
+#            (requires docker + qemu-img + mkfs.ext4 + sudo)
+#   all      Build all of the above
+#
+#   --check  (vm only) run the vm build-prereq checks and exit; does not build.
+#   --label  (relay only, repeatable) add an image label KEY=VALUE to the
+#            relay build (for example the
+#            org.opencontainers.image revision and source labels).
+#
+# The script tests the host for missing prerequisites and prints the exact
+# install command for anything missing — it does not assume the user read the
+# README.
+# ---------------------------------------------------------------------------
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# ── State directory (ADR 013, 2026-09-29) ────────────────────────────────
+# Base disks are HOST-SIDE VM state: one set per machine, shared by every
+# project, nothing derived from the working directory. The launcher owns the
+# state directory (environment variable > configuration file key > the
+# per-user default) and its config-file parser, so the build consumes the
+# resolved value through the hidden `--print-state-dir` subcommand, exactly
+# as it consumes image refs through `--print-images`: build and launch can
+# never silently disagree about where the bases live. The legacy flat build
+# output and the per-project vms_and_docker_from_llm_box directory are NOT
+# used for base disks (that directory belongs to the box's project: the
+# Docker store image and what the box creates inside itself).
+STATE_DIR=""
+
+# ── Image names: resolved from the launcher's config (2026-09-14) ──────────
+# The launcher owns the config-file parser (single-file deployment); the
+# build consumes it through the hidden `--print-images` subcommand so
+# build and launch can never silently disagree (plan decision 2026-09-14,
+# recorded in the discussion). The exit is checked EXPLICITLY — `set -e`
+# is disabled inside the `||` contexts the callers use.
+# The launcher is a binary: LBX_BIN names it, else the release build next
+# to this script, else the debug build, else lbx on PATH.
+LBX_BIN="${LBX_BIN:-}"
+if [ -z "$LBX_BIN" ]; then
+    if [ -x "$SCRIPT_DIR/target/release/lbx" ]; then LBX_BIN="$SCRIPT_DIR/target/release/lbx"
+    elif [ -x "$SCRIPT_DIR/target/debug/lbx" ]; then LBX_BIN="$SCRIPT_DIR/target/debug/lbx"
+    elif command -v lbx >/dev/null 2>&1; then LBX_BIN="$(command -v lbx)"
+    else
+        echo "ERROR: no lbx binary found: set LBX_BIN, build one with cargo build --release (target/release/lbx), or put lbx on PATH." >&2
+        exit 1
+    fi
+fi
+export LBX_SCRIPT_DIR="$SCRIPT_DIR"
+IMAGES="$("$LBX_BIN" --print-images)" || {
+    echo "ERROR: cannot resolve the configured images (lbx --print-images failed)." >&2
+    exit 1
+}
+for _kv in $IMAGES; do
+    case "$_kv" in
+        sysbox=*) IMAGE_SYSBOX="${_kv#sysbox=}" ;;
+        docker=*) IMAGE_DOCKER="${_kv#docker=}" ;;
+        vm=*) IMAGE_VM="${_kv#vm=}" ;;
+    esac
+done
+
+# The state directory the launcher resolved (see the block above): the one
+# place base disks, `latest` and the transient build staging live.
+STATE_DIR="$("$LBX_BIN" --print-state-dir)" || {
+    echo "ERROR: cannot resolve the state directory (lbx --print-state-dir failed)." >&2
+    exit 1
+}
+if [ -z "$STATE_DIR" ]; then
+    echo "ERROR: lbx --print-state-dir returned an empty state directory." >&2
+    exit 1
+fi
+
+# Test-only override: space-separated tool names to pretend missing, so the
+# prereq-failure paths are deterministically testable (tests/test_build_vm.sh).
+BUILD_VM_MISSING="${BUILD_VM_MISSING:-}"
+
+usage() {
+    cat >&2 <<'EOF'
+Usage: ./build <sysbox|docker|vm|relay|all> [--check]
+       ./build relay [--label KEY=VALUE]...
+
+Runtimes:
+  sysbox   Build image for sysbox (requires docker)
+  docker   Build image for plain Docker (requires docker)
+  vm       Build image + base disk for the KVM VM runtime
+  relay    Build the netwall relay image (llm-in-a-box-relay)
+  all      Build all of the above
+
+Options:
+  --check  (vm only) run vm build-prereq checks and exit; does not build.
+  --label  (relay only, repeatable) add the image label KEY=VALUE.
+EOF
+    exit 1
+}
+
+[ $# -ge 1 ] || usage
+RUNTIME="$1"; shift
+CHECK=false
+RELAY_LABELS=()
+if [ $# -ge 1 ] && [ "$1" = "--check" ]; then
+    CHECK=true
+else
+    while [ $# -ge 1 ]; do
+        [ "$1" = "--label" ] && [ $# -ge 2 ] || usage
+        case "$2" in
+            [!=]*=*) RELAY_LABELS+=(--label "$2") ;;
+            *) echo "ERROR: --label needs KEY=VALUE, got '$2'." >&2; exit 1 ;;
+        esac
+        shift 2
+    done
+fi
+
+case "$RUNTIME" in
+    sysbox|docker|vm|relay|all) ;;
+    *) echo "ERROR: Unknown runtime: $RUNTIME" >&2; usage ;;
+esac
+
+if [ "$CHECK" = true ] && [ "$RUNTIME" != "vm" ]; then
+    echo "ERROR: --check is only supported for the vm runtime." >&2
+    exit 1
+fi
+
+if [ ${#RELAY_LABELS[@]} -gt 0 ] && [ "$RUNTIME" != "relay" ]; then
+    echo "ERROR: --label is only supported for the relay image." >&2
+    exit 1
+fi
+
+# ── vm build prerequisite checks ────────────────────────────────────────────
+# The vm build is fully container-based: `llm-in-a-box:vm` itself runs the
+# ownership-sensitive rootfs extraction + disk build as root *inside a Docker
+# container*, so the host needs only docker (no sudo, no host qemu-img/mkfs).
+# Host-side qemu/kvm/ssh prereqs are enforced at runtime by lbx
+# --runtime vm (Phase 2), not by the build.
+# BUILD_VM_MISSING (test-only) forces a tool to report missing.
+VM_PREREQ_FAIL=0
+VM_MISSING_TOOLS=()
+
+vm_have_tool() {
+    local name="$1"
+    case " $BUILD_VM_MISSING " in *" $name "*) return 1 ;; esac
+    case "$name" in
+        *) command -v "$name" >/dev/null 2>&1 ;;
+    esac
+}
+
+vm_prereq() {
+    local name="$1" fix="$2"
+    if vm_have_tool "$name"; then
+        echo "[PASS] $name"
+    else
+        echo "[FAIL] $name — $fix"
+        VM_PREREQ_FAIL=$((VM_PREREQ_FAIL + 1))
+        VM_MISSING_TOOLS+=("$name")
+    fi
+}
+
+check_vm_prereqs() {
+    echo "==> Checking vm build prerequisites"
+    vm_prereq docker "curl -fsSL https://get.docker.com | sh"
+    echo ""
+    if [ "$VM_PREREQ_FAIL" -ne 0 ]; then
+        echo "FIX — install the missing pieces, then re-run:"
+        for t in "${VM_MISSING_TOOLS[@]}"; do
+            case "$t" in
+                docker) echo "  docker: curl -fsSL https://get.docker.com | sh  (then: sudo usermod -aG docker \$USER && newgrp docker)" ;;
+            esac
+        done
+        echo ""
+        echo "  Note: the base-disk build needs no host sudo/qemu-img/mkfs —"
+        echo "  it runs inside a root Docker container (llm-in-a-box:vm)."
+        return 1
+    fi
+    return 0
+}
+
+# ── Image build (all runtimes) ─────────────────────────────────────────────
+# ── Relay image (netwall door, 2026-09-03) ────────────────────────────────
+build_relay() {
+    if ! command -v docker &>/dev/null; then
+        echo "ERROR: docker is required to build the relay image but is not installed." >&2
+        return 1
+    fi
+    echo "==> Building llm-in-a-box-relay:latest ..."
+    docker build "${RELAY_LABELS[@]}" -t llm-in-a-box-relay:latest "$SCRIPT_DIR/docker/relay" \
+        || return 1
+    echo "==> Built llm-in-a-box-relay:latest successfully."
+}
+
+build_docker_image() {
+    local runtime="$1"
+    local tag
+    case "$runtime" in
+        sysbox) tag="$IMAGE_SYSBOX" ;;
+        docker) tag="$IMAGE_DOCKER" ;;
+        vm) tag="$IMAGE_VM" ;;
+        *) echo "ERROR: unknown runtime '$runtime'." >&2; return 1 ;;
+    esac
+    if ! command -v docker &>/dev/null; then
+        echo "ERROR: docker is required to build the $runtime image but is not installed." >&2
+        return 1
+    fi
+    echo "==> Building $tag ..."
+    # NOTE: must not rely on set -e here — the caller invokes this function
+    # in a `|| return` context, which disables -e for the WHOLE function
+    # body, so a failed docker build would silently fall through to the
+    # success echo (2026-09-02: a failed build printed "Built ..." and the
+    # base-disk stage ran with no image). Capture the exit explicitly, and
+    # also verify the tag actually landed (belt and suspenders against
+    # buildkit reporting success without the image being present).
+    docker build \
+        --no-cache \
+        --build-arg "RUNTIME_TYPE=${runtime}" \
+        -t "$tag" \
+        "$SCRIPT_DIR" || { echo "ERROR: docker build failed for $tag." >&2; return 1; }
+    if ! docker image inspect "$tag" >/dev/null 2>&1; then
+        echo "ERROR: docker build reported success but '$tag' is not present." >&2
+        return 1
+    fi
+    echo "==> Built $tag successfully."
+}
+
+# ── vm base disk pipeline (validated in the Option-A spike) ────────────────
+# Runs INSIDE a root Docker container so no host sudo is ever needed and
+# root ownership is preserved for the guest (e2fsprogs is Priority:required
+# in the Ubuntu image, qemu-utils is installed in the vm branch). Transient
+# storage is two-tier (2026-09-02 user directive — keep the vm's small root
+# disk safe):
+#   - the rootfs.tar export stages under $STATE_DIR/tmp (bulk archive on the
+#     state directory's filesystem, no ownership semantics);
+#   - the ownership-critical work (tar extraction, 30G base.raw, mkfs)
+#     mounts at /work from a LOCAL scratch dir, because the 9p export
+#     refuses chown-to-root (verified empirically: even the vm root cannot
+#     chown a file to 0:0 on it) and a guest rootfs with wrong ownership
+#     does not boot. Ownership correctness is proven by the real boot in
+#     tests/verify-vm-e2e.sh.
+# Outputs (/state) are chowned to the invoking user.
+build_vm_base_disk() {
+    local work lwork ts staging
+    mkdir -p "$STATE_DIR/tmp" "$STATE_DIR/bases"
+    work="$(mktemp -d "$STATE_DIR/tmp/llm-in-a-box-vmdisk.XXXXXX")"
+    # The scratch directory: where the rootfs is extracted and the 30G
+    # base.raw is filled with it. It needs roughly twice the rootfs size, so a
+    # host whose root disk is small can point it at another real local
+    # filesystem with LBX_VM_BUILD_WORK. It must NOT be the 9p export: that
+    # refuses chown-to-root, and a guest rootfs with wrong ownership does not
+    # boot. The state directory may be the export, which is why the scratch is
+    # separate from it.
+    lwork_ours=0
+    lwork_cfg="${LBX_VM_BUILD_WORK:-${LLMBOX_VM_BUILD_WORK:-}}"
+    if [ -n "$lwork_cfg" ]; then
+        lwork="$lwork_cfg"
+        mkdir -p "$lwork"
+    else
+        lwork="$(mktemp -d /tmp/llm-in-a-box-work.XXXXXX)"
+        lwork_ours=1
+    fi
+    # Immutable, versioned base images (2026-09-03): stage into a fresh
+    # timestamped directory under the state directory and flip `latest` only
+    # on success, so a running session (holding its own base open) never
+    # conflicts with a rebuild and a failed build never corrupts the active
+    # base.
+    ts="$(date +%Y%m%d-%H%M%S)-$$"
+    staging="$STATE_DIR/bases/$ts.tmp"
+    mkdir -p "$staging"
+
+    mkdir -p "$STATE_DIR"
+
+    local cid
+    cid=$(docker create "$IMAGE_VM")
+    docker export "$cid" -o "$work/rootfs.tar"
+    docker rm "$cid" >/dev/null
+    # Provenance record (2026-09-14): which image this base was built
+    # from. The vm preflight warns when it differs from the currently
+    # configured image (CFG30). RepoDigests is empty for locally built
+    # images — fall back to the resolved ref (tag-equality limitation,
+    # stated in the docs).
+    digest=$(docker image inspect --format '{{.RepoDigests}}' "$IMAGE_VM" 2>/dev/null || true)
+    digest=$(printf '%s' "$digest" | tr -d '[]' | cut -d' ' -f1)
+    [ -n "$digest" ] || digest="$IMAGE_VM"
+    printf '%s
+' "$digest" > "$staging/from-image"
+
+    echo "==> Building base image '$ts' (this can take a few minutes) ..."
+    docker run --rm --entrypoint bash \
+        -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+        -v "$work/rootfs.tar:/rootfs.tar:ro" \
+        -v "$lwork:/work" \
+        -v "$staging:/state" \
+        "$IMAGE_VM" -c '
+            set -e
+            # Clean up transient inputs even when the build fails: the
+            # invoking user cannot delete root-owned leftovers, and the
+            # resulting permission-error spew masks the real failure
+            # (2026-09-03 incident). The trap makes the host-side
+            # `rm -rf` cleanup below always succeed.
+            cleanup_work() {
+                rm -rf /work/rootfs 2>/dev/null || true
+                rm -f /work/base.raw 2>/dev/null || true
+                chown -R "${HOST_UID}:${HOST_GID}" /work 2>/dev/null || true
+            }
+            trap cleanup_work EXIT
+            mkdir -p /work/rootfs
+            tar -xpf /rootfs.tar -C /work/rootfs
+            # the container filesystem carries docker-injection markers that
+            # would make the guest systemd misdetect as a container (docker
+            # adds these at "docker create"); strip them so systemd detects
+            # KVM instead ("Detected virtualization kvm").
+            rm -f /work/rootfs/.dockerenv /work/rootfs/run/.containerenv
+            kernel=$(ls /work/rootfs/boot/vmlinuz-* 2>/dev/null | head -1 || true)
+            if [ -n "$kernel" ]; then
+                cp "$kernel" /state/vmlinuz
+                chmod a+r /state/vmlinuz
+            else
+                echo "ERROR: no kernel found in the vm image /boot — cannot build a bootable disk." >&2
+                exit 1
+            fi
+            initrd=$(ls /work/rootfs/boot/initrd.img-* 2>/dev/null | head -1 || true)
+            if [ -n "$initrd" ]; then
+                cp "$initrd" /state/initrd.img
+                chmod a+r /state/initrd.img
+            else
+                echo "WARNING: no initrd.img in the vm image /boot — booting without one;"
+                echo "         in-guest setup modprobes the needed virtio modules."
+            fi
+            qemu-img create -f raw /work/base.raw 30G >/dev/null
+            mkfs.ext4 -d /work/rootfs -F /work/base.raw >/dev/null 2>&1
+            qemu-img convert -O qcow2 /work/base.raw /state/base.qcow2
+            # Box-user era stamp (2026-09-20): the base records the
+            # uid-1000 user of its OWN rootfs (the guest builtin box user
+            # — agent). lbx
+            # refuses to boot a base without this stamp. Computed from
+            # the live /etc/passwd so it can never drift from the image.
+            boxuser=$(awk -F: "\$3==1000{print \$1}" /work/rootfs/etc/passwd 2>/dev/null | head -1)
+            [ -n "$boxuser" ] || boxuser="agent"
+            echo "$boxuser" > /state/built-user
+            # drop the transient inputs while root can, then hand the (now
+            # near-empty) work dir back to the invoking user so the host-side
+            # rm -rf cleanup below always succeeds even after a failure.
+            rm -rf /work/rootfs
+            rm -f /work/base.raw
+            chown -R "${HOST_UID}:${HOST_GID}" /state
+            chown -R "${HOST_UID}:${HOST_GID}" /work
+            echo "==> Built base image in /state (base.qcow2, vmlinuz, initrd.img, built-user)"
+        '
+    if [ ! -f "$staging/base.qcow2" ] || [ ! -f "$staging/vmlinuz" ]; then
+        echo "ERROR: the base-disk build produced no artifacts in the staging dir." >&2
+        rm -rf "$staging" "$work" "$lwork"
+        return 1
+    fi
+    # Only remove a scratch this run created: LBX_VM_BUILD_WORK may name a
+    # directory the caller shares or reuses.
+    [ "$lwork_ours" = 1 ] && rm -rf "$lwork" 2>/dev/null
+    rm -rf "$work" 2>/dev/null \
+        || echo "WARNING: could not fully clean transient dirs (see /tmp/llm-in-a-box-work.*); safe to remove as root." >&2
+    mv "$staging" "$STATE_DIR/bases/$ts"
+    ln -sfn "$ts" "$STATE_DIR/bases/latest"
+    echo "==> Base image '$ts' staged; latest -> $ts"
+    gc_vm_bases
+}
+
+build_vm() {
+    check_vm_prereqs || return 1
+    # A running vm session no longer blocks the build: base images are
+    # IMMUTABLE and versioned (bases/<ts>/), so a rebuild stages a fresh
+    # directory and flips `latest`; running sessions keep using the base
+    # their overlays chain to (2026-09-03). Advisory only.
+    if pgrep -f qemu-system-x86_64 >/dev/null 2>&1; then
+        echo "NOTE: a box vm session is running — it will keep using its"
+        echo "      current base image; new sessions will use the new one."
+    fi
+    if docker image inspect "$IMAGE_VM" >/dev/null 2>&1; then
+        echo "NOTE: using configured vm image '$IMAGE_VM' (image build skipped)."
+    elif [ "$IMAGE_VM" = "llm-in-a-box:vm" ]; then
+        # Only the DEFAULT name is auto-built — never build the project
+        # image under a user's tag (silent wrong-image substitution).
+        build_docker_image vm || return 1
+    else
+        echo "ERROR: configured vm image '$IMAGE_VM' is not present locally; pull it first:" >&2
+        echo "       docker pull $IMAGE_VM" >&2
+        return 1
+    fi
+    # Toolchain probe (2026-09-14): the base-disk pipeline runs INSIDE the
+    # configured image (its bash/tar/qemu-img/mkfs.ext4, as root in a
+    # container). Probe with /bin/sh so a missing bash is reported
+    # precisely, and fail BEFORE the export pipeline — never with a lie
+    # like "produced no artifacts".
+    if ! docker run --rm --entrypoint /bin/sh "$IMAGE_VM" -c \
+            'command -v bash && command -v qemu-img && command -v mkfs.ext4 && command -v tar && ls /boot/vmlinuz-*' >/dev/null 2>&1; then
+        echo "ERROR: configured vm image '$IMAGE_VM' lacks the base-disk toolchain." >&2
+        echo "       It must carry bash, qemu-utils, e2fsprogs and tar, and a kernel in /boot/vmlinuz-*." >&2
+        return 1
+    fi
+    build_vm_base_disk
+}
+
+# ── Base-image GC (2026-09-03): docker-image-prune analog. A base dir is
+# garbage when NO session overlay references it and it is not the current
+# `latest`. Overlays and bases live in the same state directory (ADR 013), so
+# the reference scan reads $STATE_DIR/sessions/*/overlay.qcow2 directly.
+# Fail-safe: if any overlay's backing reference cannot be read, skip deletions
+# entirely.
+gc_vm_bases() {
+    [ -d "$STATE_DIR/bases" ] || return 0
+    local latest_ts refs=() ref d ts in_use removed=0 kept=0
+    latest_ts=$(readlink "$STATE_DIR/bases/latest" 2>/dev/null || true)
+    for ov in "$STATE_DIR"/sessions/*/overlay.qcow2; do
+        [ -f "$ov" ] || continue
+        ref=$(qemu-img info "$ov" 2>/dev/null | awk '/^backing file:/ { sub(/^backing file: */, ""); print; exit }')
+        if [ -z "$ref" ]; then
+            echo "GC: skipped — cannot read the backing file of '$ov' (fail-safe: nothing removed)." >&2
+            return 0
+        fi
+        refs+=("$ref")
+    done
+    # sweep failed-build staging leftovers
+    rm -rf "$STATE_DIR"/bases/*.tmp 2>/dev/null || true
+    for d in "$STATE_DIR"/bases/*; do
+        [ -d "$d" ] || continue
+        # The glob also matches the `latest` SYMLINK; rm -rf on a
+        # symlink-with-slash deletes the TARGET's contents. Test -L on
+        # the slash-free path (trailing slashes are resolved before the
+        # link check and would defeat the guard) — 2026-09-03 incident.
+        [ ! -L "$d" ] || continue
+        ts=$(basename "$d")
+        in_use=0
+        for ref in "${refs[@]}"; do
+            [ "$ref" = "$STATE_DIR/bases/$ts/base.qcow2" ] && in_use=1
+        done
+        if [ "$in_use" = 0 ] && [ "$ts" != "$latest_ts" ]; then
+            rm -rf "$d"
+            removed=$((removed + 1))
+        else
+            kept=$((kept + 1))
+        fi
+    done
+    echo "==> GC: removed $removed unreferenced base image(s); kept $kept (referenced by sessions or newest)."
+}
+
+# ── Dispatch ───────────────────────────────────────────────────────────────
+if [ "$CHECK" = true ]; then
+    check_vm_prereqs || exit 1
+    exit 0
+fi
+
+case "$RUNTIME" in
+    sysbox)
+        build_docker_image sysbox
+        ;;
+    docker)
+        build_docker_image docker
+        ;;
+    vm)
+        build_vm
+        ;;
+    relay)
+        build_relay
+        ;;
+    all)
+        failed=0
+        if command -v docker &>/dev/null; then
+            build_docker_image sysbox || (( ++failed ))
+            build_docker_image docker || (( ++failed ))
+            build_vm || (( ++failed ))
+        else
+            echo "ERROR: docker not found — cannot build any images." >&2
+            exit 1
+        fi
+        if [ "$failed" -gt 0 ]; then
+            echo "WARNING: $failed build(s) failed." >&2
+            exit 1
+        fi
+        ;;
+esac

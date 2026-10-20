@@ -1,0 +1,4 @@
+bin.name = "lbx"
+args = ["--bogus", "s"]
+status.code = 1
+stdout = ""

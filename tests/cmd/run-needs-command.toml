@@ -1,0 +1,10 @@
+bin.name = "lbx"
+args = ["--run", "--runtime", "docker", "job"]
+status.code = 125
+stdout = ""
+stderr = """
+
+ERROR: --run needs a command after -- (lbx --run ... <name> -- <command> [args...]).
+
+lbx-run: status=refused code=125
+"""

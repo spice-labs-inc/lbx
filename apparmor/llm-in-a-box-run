@@ -1,0 +1,184 @@
+# llm-in-a-box-run: AppArmor profiles for the run box of an unattended run
+# (`lbx --run --apparmor-profile`).
+#
+# Two profiles, loaded together by root on the host:
+#   apparmor_parser -r apparmor/llm-in-a-box-run
+#   llm-in-a-box-run             for a run with a network policy (the relay)
+#   llm-in-a-box-run-no-network  for a run with --no-network: the same rules
+#                                without internet sockets
+#
+# What they do, on top of docker's own default profile (docker-default,
+# github.com/moby/profiles, apparmor/template.go, whose rules they repeat):
+#   - Files can be read, mapped, locked and executed anywhere, but written
+#     only in /run/agent (read-only in the box anyway), /data, /tmp,
+#     /var/tmp, /dev/shm, the box user's home directory, the device nodes
+#     programs write to, the /proc entries docker-default leaves writable,
+#     and the /etc and /var/log files the entrypoint changes while it maps
+#     the box user to the host user. Connecting to a Unix socket that has
+#     a path needs the same write permission, so such a socket can be
+#     reached only inside those directories.
+#   - Abstract and unnamed Unix sockets (socket pairs included) connect,
+#     send and receive only between processes under the same profile.
+#   - The no-network profile allows no internet (IPv4 or IPv6) socket at
+#     all, loopback included.
+#
+# What they cannot do: AppArmor mediates sockets that have a path only
+# through file rules, which cannot tell a socket from a regular file, so a
+# socket inside a writable directory such as /data or /tmp can still be
+# reached. The profiles are defense in depth, not the boundary that
+# decides which sockets the run box can reach (that is the run box's own
+# network namespace and its two host mounts, /data and /run/agent).
+#
+# ABI 3.0, as docker-default pins it: under ABI 4.0 and later a bare
+# `network` rule no longer covers Unix sockets.
+#
+# Like docker-default, each profile includes <abstractions/base>, which
+# on its own allows a few more things: receiving on Unix sockets from
+# unconfined processes, writing (and so connecting) to /dev/log, the
+# systemd journal sockets under /run/systemd/journal and
+# /run/uuidd/request, the owner's ~/.Private, and being read or traced by
+# any peer. docker-default's signal rule for the docker daemon's own
+# profile is not repeated: the daemon runs unconfined on the hosts this is
+# for, which the peer=unconfined rule covers. The entrypoint's write of
+# /etc/docker/daemon.json (for an inner docker a run box does not have) is
+# not allowed and fails harmlessly.
+
+abi <abi/3.0>,
+
+include <tunables/global>
+
+profile llm-in-a-box-run flags=(attach_disconnected,mediate_deleted) {
+  include <abstractions/base>
+
+  # Internet, netlink and packet sockets as docker-default allows them;
+  # Unix sockets only through the unix rules below.
+  network inet,
+  network inet6,
+  network netlink,
+  network packet,
+
+  unix (create, bind, listen, accept, shutdown, getattr, setattr, getopt, setopt),
+  unix (connect, send, receive) peer=(label=llm-in-a-box-run),
+
+  capability,
+  umount,
+
+  # Read, map, lock and run anything.
+  /** rmk,
+  /** ix,
+
+  # Where the command and the tools write.
+  /run/agent/** rw,
+  /data/{,**} rwlk,
+  /tmp/{,**} rwlk,
+  /var/tmp/{,**} rwlk,
+  /dev/shm/{,**} rwlk,
+  /home/agent/{,**} rwlk,
+  /dev/{null,zero,full,random,urandom,tty,ptmx} rw,
+  /dev/pts/* rw,
+  @{PROC}/** rw,
+
+  # What the entrypoint changes while it maps the box user (the shadow
+  # tools write the account files through lock, backup and temporary
+  # files next to them, and update the login records; when usermod cannot
+  # rename the user, the entrypoint edits /etc/passwd with sed -i, which
+  # writes a temporary file next to it), removes the
+  # sudoers grant and writes the proxy settings.
+  /etc/{passwd,group,shadow,gshadow,subuid,subgid}* rwlk,
+  /etc/n{passwd,group,shadow,gshadow}* rwlk,
+  /etc/.pwd.lock rwk,
+  /etc/sed* rwl,
+  /etc/sudoers.d/{,**} rw,
+  /etc/profile.d/box-proxy.sh rw,
+  /etc/apt/apt.conf.d/95box-proxy rw,
+  /var/log/{lastlog,faillog} rwk,
+
+  signal (receive) peer=unconfined,
+  signal (receive) peer=runc,
+  signal (receive) peer=crun,
+  signal (send,receive) peer=llm-in-a-box-run,
+
+  # docker-default's denials, unchanged.
+  deny @{PROC}/* w,
+  deny @{PROC}/{[^1-9/],[^1-9/][^0-9/],[^1-9s/][^0-9y/][^0-9s/],[^1-9/][^0-9/][^0-9/][^0-9/]*}/** w,
+  deny @{PROC}/sys/[^k]** w,
+  deny @{PROC}/sys/kernel/{?,??,[^s][^h][^m]**} w,
+  deny @{PROC}/sysrq-trigger rwklx,
+  deny @{PROC}/kcore rwklx,
+
+  deny mount,
+
+  deny /sys/[^f]*/** wklx,
+  deny /sys/f[^s]*/** wklx,
+  deny /sys/fs/[^c]*/** wklx,
+  deny /sys/fs/c[^g]*/** wklx,
+  deny /sys/fs/cg[^r]*/** wklx,
+  deny /sys/firmware/** rwklx,
+  deny /sys/devices/virtual/powercap/** rwklx,
+  deny /sys/kernel/security/** rwklx,
+
+  ptrace (trace,tracedby,read,readby) peer=llm-in-a-box-run,
+}
+
+profile llm-in-a-box-run-no-network flags=(attach_disconnected,mediate_deleted) {
+  include <abstractions/base>
+
+  # No internet socket of either family, loopback included; netlink stays
+  # (programs read their own interfaces and addresses through it).
+  network netlink,
+  deny network inet,
+  deny network inet6,
+
+  unix (create, bind, listen, accept, shutdown, getattr, setattr, getopt, setopt),
+  unix (connect, send, receive) peer=(label=llm-in-a-box-run-no-network),
+
+  capability,
+  umount,
+
+  /** rmk,
+  /** ix,
+
+  /run/agent/** rw,
+  /data/{,**} rwlk,
+  /tmp/{,**} rwlk,
+  /var/tmp/{,**} rwlk,
+  /dev/shm/{,**} rwlk,
+  /home/agent/{,**} rwlk,
+  /dev/{null,zero,full,random,urandom,tty,ptmx} rw,
+  /dev/pts/* rw,
+  @{PROC}/** rw,
+
+  /etc/{passwd,group,shadow,gshadow,subuid,subgid}* rwlk,
+  /etc/n{passwd,group,shadow,gshadow}* rwlk,
+  /etc/.pwd.lock rwk,
+  /etc/sed* rwl,
+  /etc/sudoers.d/{,**} rw,
+  /etc/profile.d/box-proxy.sh rw,
+  /etc/apt/apt.conf.d/95box-proxy rw,
+  /var/log/{lastlog,faillog} rwk,
+
+  signal (receive) peer=unconfined,
+  signal (receive) peer=runc,
+  signal (receive) peer=crun,
+  signal (send,receive) peer=llm-in-a-box-run-no-network,
+
+  deny @{PROC}/* w,
+  deny @{PROC}/{[^1-9/],[^1-9/][^0-9/],[^1-9s/][^0-9y/][^0-9s/],[^1-9/][^0-9/][^0-9/][^0-9/]*}/** w,
+  deny @{PROC}/sys/[^k]** w,
+  deny @{PROC}/sys/kernel/{?,??,[^s][^h][^m]**} w,
+  deny @{PROC}/sysrq-trigger rwklx,
+  deny @{PROC}/kcore rwklx,
+
+  deny mount,
+
+  deny /sys/[^f]*/** wklx,
+  deny /sys/f[^s]*/** wklx,
+  deny /sys/fs/[^c]*/** wklx,
+  deny /sys/fs/c[^g]*/** wklx,
+  deny /sys/fs/cg[^r]*/** wklx,
+  deny /sys/firmware/** rwklx,
+  deny /sys/devices/virtual/powercap/** rwklx,
+  deny /sys/kernel/security/** rwklx,
+
+  ptrace (trace,tracedby,read,readby) peer=llm-in-a-box-run-no-network,
+}

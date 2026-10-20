@@ -1,0 +1,9 @@
+{
+  "mode": "locked",
+  "allow": [
+    "api.anthropic.com",
+    "api.code.umans.ai",
+    "api.deepseek.com"
+  ],
+  "block": []
+}

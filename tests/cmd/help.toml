@@ -1,0 +1,4 @@
+bin.name = "lbx"
+args = ["--help"]
+status.code = 0
+stderr = ""

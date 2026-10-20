@@ -1,0 +1,9 @@
+---
+source: tests/contract.rs
+expression: "String::from_utf8_lossy(&out)"
+---
+NAME                     RUNTIME  STATE      PORT   NET-POLICY
+Box                      sysbox   exited     -      -
+avm                      vm       exited     2222   -
+old                      docker   exited     -      -
+zed                      docker   running    -      -

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://raw.githubusercontent.com/cortexkit/magic-context/master/assets/magic-context.schema.json",
+  "enabled": true,
+  "historian": {
+    "pi": {
+      // Cheapest Umans catalog model for background history summarization.
+      // Requires Umans auth at runtime (/login umans or UMANS_API_KEY);
+      // change this to any valid provider/model-id to suit your setup.
+      "model": "umans/umans-deepseek-v4-flash-0731"
+    }
+  },
+  "embedding": {
+    "provider": "local"
+  }
+}

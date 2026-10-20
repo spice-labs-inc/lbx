@@ -1,0 +1,9 @@
+bin.name = "lbx"
+args = ["a b"]
+status.code = 1
+stdout = ""
+stderr = "ERROR: Invalid session name 'a b' (allowed: letters, digits, '.', '_', '-'; must start with a letter or digit).\n"
+[env.add]
+HOME = "/nonexistent-home"
+LLMBOX_STATE_DIR = "/nonexistent-state"
+LLMBOX_CONFIG = "/nonexistent-config"

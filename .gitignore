@@ -1,0 +1,27 @@
+# Rust build output of the launcher crate
+target/
+
+# Claude Code per-machine local settings (shared settings belong in
+# .claude/settings.json, which stays tracked)
+.claude/settings.local.json
+
+# Editor and OS droppings
+*~
+*.swp
+*.swo
+.DS_Store
+
+# QEMU and disk-image artifacts: base disks live in the launcher's state
+# directory and the docker store image in a project's
+# vms_and_docker_from_llm_box directory, never in the repository.
+*.qcow2
+*.raw
+*.img
+/vms_and_docker_from_llm_box/
+
+# Logs and test output
+*.log
+test-logs/
+
+# The user-level gitignore may hide markdown; this repository tracks it.
+!*.md

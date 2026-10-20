@@ -1,0 +1,12 @@
+# Local AppArmor override for the fusermount3 profile that Ubuntu 25.04 and
+# later ship with the fuse3 package. sysbox-fs mounts a FUSE filesystem under
+# /var/lib/sysboxfs/<container id>/ for every box; the shipped profile lists
+# only user-facing mount points, so every box creation fails with
+# "fusermount3: mount failed: Permission denied" until this is allowed.
+#
+# Install (the shipped profile includes local/fusermount3 if it exists, so
+# this survives fuse3 package updates):
+#   sudo install -m 644 apparmor/fusermount3-sysboxfs /etc/apparmor.d/local/fusermount3
+#   sudo apparmor_parser -r /etc/apparmor.d/fusermount3
+  mount fstype=@{fuse_types} options=(nosuid,nodev) options in (ro,rw,noatime,dirsync,nodiratime,noexec,sync) -> /var/lib/sysboxfs/**/,
+  umount /var/lib/sysboxfs/**/,

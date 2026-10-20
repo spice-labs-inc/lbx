@@ -1,0 +1,80 @@
+Usage: lbx [options] <session_name>
+
+Options:
+  --runtime <sysbox|docker|vm>          Choose isolation runtime (default: auto-detect;
+                                        see runtime.default in the config file)
+  --device <path>                       Pass a host device into the session (repeatable)
+  --fuse                                Enable FUSE support
+  --ports                               Expose session ports 8080 and 3000 on the host
+  --publish <hostport>:<boxport>        Expose any port served by the box on the host
+                                        (repeatable)
+  --vm-web-port <hostport>:<vmport>     Expose the qemu VM web port on the host
+  --destroy                             Remove the session (docker rm -f, or kill+delete the vm)
+  --shutdown [--force] <name>...         Gracefully stop one or more sessions (any runtime); --force kills
+  --stop [--force] <name>...             Same as --shutdown (alias)
+  --list                                List all sessions across all runtimes
+  --net-policy <file>                    Host-side network wall policy (JSON: mode/allow/block); default: no wall
+  --denied <name>                        Print the session's deny log
+  --print-images                        Print the configured image refs (build parity; internal)
+  --print-state-dir                     Print the resolved state directory (build parity; internal)
+  --run                                 Unattended run: run one command in a new, locked-down box,
+                                        then remove the box (see "Unattended runs" below)
+  --data <dir>                          Unattended run: host directory mounted at /data
+  --env <NAME>                          Unattended run: make host variable NAME available to the
+                                        command (repeatable)
+  --timeout <seconds>                   Unattended run: stop the command after this many seconds
+                                        (1 to 604800)
+  --no-network                          Unattended run: no network at all, only loopback, no relay
+                                        (instead of --net-policy)
+  --socket-dir <dir>                    Unattended run: directory of your Unix sockets, mounted
+                                        read-only at /run/agent
+  --apparmor-profile                    Unattended run: run the box under the llm-in-a-box AppArmor
+                                        profile (root loads apparmor/llm-in-a-box-run first)
+
+Unattended runs:
+  lbx --run --runtime docker --net-policy <file> --data <dir> --timeout <seconds>
+      [--env NAME]... <name> -- <command> [args...]
+  Runs <command> once, with no terminal, in an unprivileged run box that reaches the
+  network only through the relay (policy mode enforce or locked), then removes the box.
+  <name> must not have been used before. Exit code: the command's own; 124 timeout;
+  125 refused or setup failed (also when cleanup is incomplete after exit 0);
+  129/130/143 signal (138: SIGUSR1 during the checks or name claim). The outcome is in
+  $LBX_STATE_DIR/runs/<name>/status
+  (authoritative), the deny log in $LBX_STATE_DIR/netlogs/<name>/deny.log.
+  See docs/unattended-runs.md.
+  With no network at all (no relay, no deny log), --no-network replaces --net-policy:
+  lbx --run --runtime docker --no-network --data <dir> --timeout <seconds>
+      [--env NAME]... <name> -- <command> [args...]
+  Either form also takes [--socket-dir <dir>] [--apparmor-profile].
+
+Runtime selection: --runtime wins; otherwise auto-detect tries vm (base
+built), then sysbox (image + sysbox-runc present), then docker. A
+runtime.default config key / LBX_RUNTIME_DEFAULT env var is tried
+FIRST (when usable) and falls back to that order with a warning.
+
+Port exposure:
+  --publish and --ports expose a port SERVED BY THE BOX itself:
+    --runtime vm              qemu hostfwd (host <hostport> -> box vm <boxport>)
+    --runtime sysbox/docker   docker -p (host <hostport> -> box <boxport>)
+  --vm-web-port exposes a port of a qemu VM RUNNING INSIDE the box
+  (you run that VM; it gets the bridged 192.168.200.2):
+    --runtime vm              qemu hostfwd (host <hostport> -> vm <vmport>)
+    --runtime sysbox/docker   docker -p + in-guest DNAT to the inner VM's
+                              bridged IP; that inner-VM mode needs the
+                              sysbox tunneling grant (/dev/net/tun + NET_ADMIN)
+
+Configuration (precedence: CLI flag > env var > config file > default):
+  File:   $LBX_CONFIG (default ~/.config/llm_in_a_box/config).
+          Lines are key=value; # comments allowed.
+  Keys:   image.sysbox|image.docker|image.vm   image refs (default llm-in-a-box:*)
+          state.dir        LBX_STATE_DIR        global box-state dir (default ~/.llm-in-a-box)
+          vm.mem           LBX_VM_MEM           vm memory in MiB (default 16384)
+          vm.cpus          LBX_VM_CPUS          vm vCPUs (default 8)
+          vm.accel         LBX_VM_ACCEL         kvm (default) or tcg
+          vm.store.size    LBX_VM_STORE_IMG_SIZE  docker-store image size (default 500G)
+          vm.store.disable LBX_VM_STORE_DISABLE =1 skips the store image (guest falls back to local docker)
+          vm.missing       LBX_VM_MISSING       TEST-ONLY: pretend named vm prereqs are missing
+          runtime.default  LBX_RUNTIME_DEFAULT  preferred auto-detect runtime (tried first)
+  An unreadable/invalid config warns for cleanup ops but hard-errors when
+  creating a new docker/sysbox session, on auto-detect, and for
+  --print-images.

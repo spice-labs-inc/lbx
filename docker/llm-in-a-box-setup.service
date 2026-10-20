@@ -1,0 +1,14 @@
+[Unit]
+Description=llm-in-a-box VM setup (user remap, networking, project mount, ssh keys)
+After=local-fs.target
+Before=ssh.service
+Before=containerd.service docker.service
+ConditionPathExists=/usr/local/sbin/vm-setup.sh
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/vm-setup.sh
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,4 @@
+captured-at-commit=83f6308
+amended=2026-10-20: every create argv gained `-v <session>-docker:/var/lib/docker`,
+the per-session volume for the inner docker storage (lbx mounts it so the inner
+daemon has a filesystem of its own instead of the container overlay).

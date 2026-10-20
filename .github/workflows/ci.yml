@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      LBX_BIN: ${{ github.workspace }}/target/debug/lbx
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Unit and integration tests
+        run: cargo test --locked
+
+      # sysbox, for the suites that drive it: the sysbox runtime suite, the
+      # migration suite and T18 of the sessions suite exercise the real
+      # runtime and skip without it, and a skip that is not approved fails
+      # the run, so the runtime is installed rather than skipped. sysbox-fs
+      # needs fusermount3 from fuse3, which the sysbox-ce package does not
+      # declare (it declares fuse v2 only), and sysbox 0.7.1 is the first
+      # release that declares the `time` Linux namespace, without which
+      # containerd 2.x (Docker 28+) cannot create a container at all.
+      - name: Install sysbox
+        if: ${{ vars.LBX_SKIP_IMAGE_BUILD != 'true' }}
+        run: |
+          set -euo pipefail
+          SYSBOX_VERSION=0.7.1
+          sudo apt-get install -y -q --no-install-recommends fuse3
+          curl -fsSL -o /tmp/sysbox-ce.deb \
+            "https://downloads.nestybox.com/sysbox/releases/v${SYSBOX_VERSION}/sysbox-ce_${SYSBOX_VERSION}-0.linux_amd64.deb"
+          sudo dpkg -i /tmp/sysbox-ce.deb
+          sysbox-runc --version
+          # The runtime must be registered with the daemon before the suites
+          # ask for it; the package's postinst starts the daemons.
+          for i in $(seq 1 30); do
+            docker info --format '{{json .Runtimes}}' | grep >/dev/null sysbox-runc && break
+            sleep 1
+          done
+          docker info --format '{{json .Runtimes}}'
+
+      # ./build docker takes about half an hour on a hosted runner (Rust
+      # toolchain, JDK, Node, the agents) and the image is several gigabytes;
+      # ./build sysbox is a second build of the same size. Set the repository
+      # variable LBX_SKIP_IMAGE_BUILD=true to skip sysbox, the image builds
+      # and the docker suites when that is too long for a run.
+      - name: Build the relay, docker and sysbox images
+        if: ${{ vars.LBX_SKIP_IMAGE_BUILD != 'true' }}
+        run: |
+          df -h /
+          ./build relay
+          ./build docker
+          ./build sysbox
+
+      - name: Docker and sysbox suites
+        if: ${{ vars.LBX_SKIP_IMAGE_BUILD != 'true' }}
+        run: tests/run-all-suites.sh --no-build --lbx target/debug/lbx --logs test-logs
+
+      - name: Job summary
+        if: always()
+        run: cat test-logs/summary.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs
+          path: test-logs/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # The vm suite and the vm end-to-end check need /dev/kvm, the kvm group and
+  # qemu, which GitHub-hosted runners do not provide. They run on a
+  # self-hosted runner labeled kvm, and only when the repository variable
+  # LBX_SELF_HOSTED is "true"; a fork or a checkout without such a runner
+  # skips this job instead of waiting forever for a runner to pick it up.
+  # The sysbox suite runs in the hosted job above, where sysbox is installed.
+  kvm-and-sysbox:
+    if: ${{ vars.LBX_SELF_HOSTED == 'true' }}
+    runs-on: [self-hosted, kvm]
+    timeout-minutes: 180
+    env:
+      LBX_BIN: ${{ github.workspace }}/target/debug/lbx
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build the launcher
+        run: cargo build --locked
+
+      - name: Build the images and the vm base disk
+        run: |
+          ./build relay
+          ./build docker
+          ./build vm
+
+      - name: VM suite
+        run: bash tests/test_llm_in_a_box_vm.sh
+
+      - name: VM end to end
+        run: bash tests/verify-vm-e2e.sh

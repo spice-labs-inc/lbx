@@ -1,0 +1,26 @@
+# Update pull requests for the relay's base image (docker/relay/Dockerfile),
+# which is pinned by version and digest so a release rebuilds the same
+# way. Dependabot proposes newer versions and new digests of the pinned
+# tag. It keeps the tag's "-alpine3.24" suffix, so a move to a newer
+# Alpine release is a manual change.
+version: 2
+updates:
+  - package-ecosystem: docker
+    directory: /docker/relay
+    schedule:
+      interval: weekly
+    # A new upstream version waits a week before Dependabot proposes it.
+    cooldown:
+      default-days: 7
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7

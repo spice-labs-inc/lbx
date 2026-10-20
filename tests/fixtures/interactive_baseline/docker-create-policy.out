@@ -1,0 +1,5 @@
+==> Creating new container 's1' (docker) ...
+    (netwall: --internal network 'llm-in-a-box-net-s1' + relay 'llm-in-a-box-relay-s1'; policy <FIXTURE>/policy.json)
+
+  Welcome to llm in a box... where agents are constrained
+

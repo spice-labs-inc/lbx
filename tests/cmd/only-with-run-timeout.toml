@@ -1,0 +1,5 @@
+bin.name = "lbx"
+args = ["--timeout", "5", "probe"]
+status.code = 1
+stdout = ""
+stderr = "ERROR: --timeout is only valid with --run.\n"

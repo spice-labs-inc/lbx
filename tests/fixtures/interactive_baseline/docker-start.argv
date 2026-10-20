@@ -1,0 +1,59 @@
+docker
+    container
+    inspect
+    -f
+    {{index .Config.Labels "llm-in-a-box.runtime"}}|{{.Config.Image}}|{{.State.Status}}
+    s1
+
+docker
+    inspect
+    -f
+    {{.State.Status}}
+    s1
+
+docker
+    container
+    inspect
+    -f
+    {{index .Config.Labels "llm-in-a-box.user"}}
+    s1
+
+docker
+    container
+    inspect
+    llm-in-a-box-relay-s1
+
+docker
+    start
+    s1
+
+docker
+    inspect
+    -f
+    {{.State.Status}}
+    s1
+
+docker
+    exec
+    s1
+    test
+    -f
+    /tmp/.user-ready
+
+docker
+    exec
+    s1
+    id
+    <USER>
+
+docker
+    exec
+    -it
+    -e
+    HOME=/home/agent
+    -w
+    /data
+    s1
+    gosu
+    <USER>
+    bash

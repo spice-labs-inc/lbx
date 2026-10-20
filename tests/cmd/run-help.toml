@@ -1,0 +1,10 @@
+bin.name = "lbx"
+args = ["--run", "--help"]
+status.code = 125
+stdout = ""
+stderr = """
+
+ERROR: --help cannot be combined with --run.
+
+lbx-run: status=refused code=125
+"""

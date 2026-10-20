@@ -1,0 +1,81 @@
+docker
+    container
+    inspect
+    -f
+    {{index .Config.Labels "llm-in-a-box.runtime"}}|{{.Config.Image}}|{{.State.Status}}
+    s1
+
+docker
+    inspect
+    -f
+    {{.State.Status}}
+    s1
+
+docker
+    image
+    inspect
+    llm-in-a-box:docker
+
+docker
+    image
+    inspect
+    --format
+    {{.Config.User}}
+    llm-in-a-box:docker
+
+docker
+    run
+    -d
+    --privileged
+    --name
+    s1
+    --hostname
+    s1
+    --label
+    llm-in-a-box.runtime=docker
+    --label
+    llm-in-a-box.user=agent
+    -e
+    HOST_USER=<USER>
+    -e
+    HOST_UID=<UID>
+    -e
+    HOST_GID=<GID>
+    -e
+    GH_TOKEN=baseline-token-value
+    -v
+    <FIXTURE>/cwd:/data
+    -v
+    s1-docker:/var/lib/docker
+    llm-in-a-box:docker
+
+docker
+    inspect
+    -f
+    {{.State.Status}}
+    s1
+
+docker
+    exec
+    s1
+    test
+    -f
+    /tmp/.user-ready
+
+docker
+    exec
+    s1
+    id
+    <USER>
+
+docker
+    exec
+    -it
+    -e
+    HOME=/home/agent
+    -w
+    /data
+    s1
+    gosu
+    <USER>
+    bash

@@ -1,0 +1,50 @@
+# Checks allowed to skip in every pass of tests/run-all-suites.sh.
+# One per line: <suite file>|<check name prefix>. Any other check that
+# skips everywhere fails the run. Adding a line needs the owner's approval.
+
+# No sysbox runtime on the test hosts (the hosted virtual machines).
+test_llm_in_a_box_sessions.sh|T18 destroy
+
+# Kernels whose AppArmor does not mediate Unix sockets (no
+# /sys/kernel/security/apparmor/features/network/af_unix saying yes): the
+# AppArmor profile checks cannot run there, and lbx refuses
+# --apparmor-profile on such a kernel (VRUN29 checks that refusal). On a
+# kernel that mediates them, VRUN25-VRUN28 serve their socket from
+# /srv/lbx-test, a host path the profile does not allow, and skip with
+# that reason; VRUN30 and VRUN31 pin the two measured behaviors those
+# checks cannot reach. Remove when the checks serve from an allowed path.
+verify-run-unattended.sh|VRUN25 under the profile
+verify-run-unattended.sh|VRUN26 the profile
+verify-run-unattended.sh|VRUN27 under the profile
+verify-run-unattended.sh|VRUN28 under the no-network profile
+
+# The runner's before-images pass runs this check on a host with NO
+# llm-in-a-box image yet (a fresh CI runner). A host that already has the
+# images cannot produce the condition without deleting images the run needs, so
+# the check skips there and this line approves it.
+test_llm_in_a_box_vm.sh|unbuilt vm image falls through to the no-image error
+
+# Checks that sourced the bash launcher and called its functions directly;
+# the launcher is a Rust binary now and these live in the crate's unit tests.
+test_llm_in_a_box_config.sh|CFG29 sourced warn-class
+test_llm_in_a_box_run.sh|RUN41 the deny-log reader
+test_llm_in_a_box_sessions.sh|ST1 store image
+test_llm_in_a_box_vm.sh|L1: launch args
+test_llm_in_a_box_vm.sh|L2: the store0
+test_llm_in_a_box_vm.sh|L3: the image
+test_llm_in_a_box_vm.sh|L3b: a zero-length
+test_llm_in_a_box_vm.sh|L3c: a size-mismatched
+test_llm_in_a_box_vm.sh|L3d: a successful prepare
+test_llm_in_a_box_vm.sh|L3e: a size resolving
+test_llm_in_a_box_vm.sh|L3f: the default store
+test_llm_in_a_box_vm.sh|L4: the store image
+test_llm_in_a_box_vm.sh|L4b: LLMBOX_VM_STORE_DISABLE
+test_llm_in_a_box_vm.sh|L5: symlink
+test_llm_in_a_box_vm.sh|L5d: a symlink
+test_llm_in_a_box_vm.sh|L6: a second writer
+test_llm_in_a_box_vm.sh|L6b: two project dirs
+test_llm_in_a_box_vm.sh|L7: LLMBOX_VM_ACCEL
+test_llm_in_a_box_vm.sh|L7b: the default
+test_llm_in_a_box_vm.sh|L8: free-space
+test_llm_in_a_box_vm.sh|L8b: the warning helpers
+test_llm_in_a_box_vm.sh|L10: with both

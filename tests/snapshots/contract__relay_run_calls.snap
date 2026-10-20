@@ -1,0 +1,29 @@
+---
+source: tests/contract.rs
+expression: w.calls_redacted()
+---
+container inspect job2
+container inspect llm-in-a-box-relay-job2
+network inspect llm-in-a-box-net-job2
+network inspect llm-in-a-box-relaynet-job2
+image inspect llm-in-a-box:docker
+image inspect llm-in-a-box-relay:latest
+network create --internal -o com.docker.network.bridge.inhibit_ipv4=true llm-in-a-box-net-job2 --label llm-in-a-box.run-id=[RUN-ID]
+network create llm-in-a-box-relaynet-job2 --label llm-in-a-box.run-id=[RUN-ID]
+run -d --pull never --name llm-in-a-box-relay-job2 --label llm-in-a-box.run-id=[RUN-ID] --user [UID]:[GID] --cap-drop ALL --security-opt no-new-privileges --read-only --tmpfs /tmp -e LLMBOX_POLICY=/policy.json -e LLMBOX_DENY_LOG=/log/deny.log -e HTTP_PROXY= -e http_proxy= -e HTTPS_PROXY= -e https_proxy= -e NO_PROXY= -e no_proxy= -e FTP_PROXY= -e ftp_proxy= -e ALL_PROXY= -e all_proxy= -v [ROOT]/pol/enforce.json:/policy.json:ro -v [ROOT]/state/netlogs/job2:/log --network llm-in-a-box-net-job2 --network llm-in-a-box-relaynet-job2 llm-in-a-box-relay:latest
+exec llm-in-a-box-relay-job2 python3 -c import socket; socket.create_connection(("127.0.0.1", 3128), 2).close()
+inspect -f {{(index .NetworkSettings.Networks "llm-in-a-box-net-job2").IPAddress}} llm-in-a-box-relay-job2
+image inspect --format {{.Config.User}} llm-in-a-box:docker
+run -d --rm --pull never --name job2 --label llm-in-a-box.run-id=[RUN-ID] --label llm-in-a-box.runtime=docker --label llm-in-a-box.user=agent --label llm-in-a-box.mode=run --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add SETGID --cap-add SETUID --security-opt no-new-privileges --dns 127.0.0.1 --sysctl net.ipv6.conf.all.disable_ipv6=1 -e HOST_USER=[USER] -e HOST_UID=[UID] -e HOST_GID=[GID] -e LBX_NO_INNER_DOCKER=1 -e HTTP_PROXY=http://172.18.0.2:3128 -e HTTPS_PROXY=http://172.18.0.2:3128 -e http_proxy=http://172.18.0.2:3128 -e https_proxy=http://172.18.0.2:3128 -e NO_PROXY=localhost,127.0.0.1 -e no_proxy=localhost,127.0.0.1 -e FTP_PROXY= -e ftp_proxy= -e ALL_PROXY= -e all_proxy= -e JAVA_TOOL_OPTIONS=-Dhttp.proxyHost=172.18.0.2 -Dhttp.proxyPort=3128 -Dhttps.proxyHost=172.18.0.2 -Dhttps.proxyPort=3128 -Dhttp.nonProxyHosts=localhost|127.0.0.1 --network llm-in-a-box-net-job2 -v [ROOT]/data:/data llm-in-a-box:docker sleep 67
+exec job2 test -f /tmp/.run-ready
+exec -i -w /data -e TOK job2 gosu [USER] curl https://example.com
+container inspect -f {{index .Config.Labels "llm-in-a-box.run-id"}} job2
+rm -f job2
+container inspect -f {{index .Config.Labels "llm-in-a-box.run-id"}} llm-in-a-box-relay-job2
+rm -f llm-in-a-box-relay-job2
+network inspect -f {{index .Labels "llm-in-a-box.run-id"}} llm-in-a-box-net-job2
+network rm llm-in-a-box-net-job2
+network inspect -f {{index .Labels "llm-in-a-box.run-id"}} llm-in-a-box-relaynet-job2
+network rm llm-in-a-box-relaynet-job2
+ps -a --filter label=llm-in-a-box.run-id=[RUN-ID] --format {{.Names}}
+network ls --filter label=llm-in-a-box.run-id=[RUN-ID] --format {{.Name}}

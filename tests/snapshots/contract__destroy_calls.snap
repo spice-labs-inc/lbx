@@ -1,0 +1,15 @@
+---
+source: tests/contract.rs
+expression: w.calls_redacted()
+---
+container inspect -f {{index .Config.Labels "llm-in-a-box.runtime"}}|{{.Config.Image}}|{{.State.Status}} fresh
+container inspect fresh
+container inspect -f {{range .Mounts}}{{if eq .Destination "/var/lib/docker"}}{{println .Name}}{{end}}{{end}} fresh
+rm -f fresh
+rm -f llm-in-a-box-relay-fresh
+volume rm fresh-docker
+rm -f boc-relay-fresh
+network rm llm-in-a-box-net-fresh
+network rm llm-in-a-box-relaynet-fresh
+network rm boc-net-fresh
+network rm boc-relaynet-fresh

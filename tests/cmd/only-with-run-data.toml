@@ -1,0 +1,5 @@
+bin.name = "lbx"
+args = ["--data", "/x", "probe"]
+status.code = 1
+stdout = ""
+stderr = "ERROR: --data is only valid with --run.\n"

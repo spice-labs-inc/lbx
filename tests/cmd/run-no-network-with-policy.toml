@@ -1,0 +1,10 @@
+bin.name = "lbx"
+args = ["--run", "--no-network", "--net-policy", "/p.json", "job", "--", "true"]
+status.code = 125
+stdout = ""
+stderr = """
+
+ERROR: --no-network cannot be combined with --net-policy.
+
+lbx-run: status=refused code=125
+"""

@@ -1,0 +1,18 @@
+# The image build context is the repository root; only the files the
+# Dockerfile copies in belong in it.
+.git
+.gitignore
+.github
+README.md
+LICENSE
+docs
+build
+apparmor
+net-policies
+src
+tests
+target
+Cargo.toml
+Cargo.lock
+*.swp
+*~

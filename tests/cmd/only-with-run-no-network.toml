@@ -1,0 +1,5 @@
+bin.name = "lbx"
+args = ["--no-network", "probe"]
+status.code = 1
+stdout = ""
+stderr = "ERROR: --no-network is only valid with --run.\n"

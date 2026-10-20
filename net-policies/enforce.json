@@ -1,0 +1,32 @@
+{
+  "mode": "enforce",
+  "allow": [
+    "api.anthropic.com",
+    "api.code.umans.ai",
+    "api.deepseek.com",
+    "github.com",
+    "api.github.com",
+    "objects.githubusercontent.com",
+    "*.githubusercontent.com",
+    "cli.github.com",
+    "crates.io",
+    "static.crates.io",
+    "index.crates.io",
+    "repo1.maven.org",
+    "repo.maven.apache.org",
+    "services.gradle.org",
+    "downloads.gradle.org",
+    "repo.scala-sbt.org",
+    "registry.npmjs.org",
+    "pypi.org",
+    "files.pythonhosted.org",
+    "archive.ubuntu.com",
+    "security.ubuntu.com",
+    "ubuntu.osuosl.org",
+    "registry-1.docker.io",
+    "auth.docker.io",
+    "production.cloudflare.docker.com",
+    "production.cloudfront.docker.com"
+  ],
+  "block": []
+}

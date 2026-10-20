@@ -1,0 +1,17 @@
+---
+source: tests/contract.rs
+expression: w.calls_redacted()
+---
+container inspect job1
+container inspect llm-in-a-box-relay-job1
+network inspect llm-in-a-box-net-job1
+network inspect llm-in-a-box-relaynet-job1
+image inspect llm-in-a-box:docker
+image inspect --format {{.Config.User}} llm-in-a-box:docker
+run -d --rm --pull never --name job1 --label llm-in-a-box.run-id=[RUN-ID] --label llm-in-a-box.runtime=docker --label llm-in-a-box.user=agent --label llm-in-a-box.mode=run --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add SETGID --cap-add SETUID --security-opt no-new-privileges --dns 127.0.0.1 --sysctl net.ipv6.conf.all.disable_ipv6=1 -e HOST_USER=[USER] -e HOST_UID=[UID] -e HOST_GID=[GID] -e LBX_NO_INNER_DOCKER=1 -e HTTP_PROXY= -e http_proxy= -e HTTPS_PROXY= -e https_proxy= -e NO_PROXY= -e no_proxy= -e FTP_PROXY= -e ftp_proxy= -e ALL_PROXY= -e all_proxy= --network none -v [ROOT]/data:/data llm-in-a-box:docker sleep 67
+exec job1 test -f /tmp/.run-ready
+exec -i -w /data job1 gosu [USER] sh -c echo hi
+container inspect -f {{index .Config.Labels "llm-in-a-box.run-id"}} job1
+rm -f job1
+ps -a --filter label=llm-in-a-box.run-id=[RUN-ID] --format {{.Names}}
+network ls --filter label=llm-in-a-box.run-id=[RUN-ID] --format {{.Name}}
