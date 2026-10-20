@@ -41,7 +41,7 @@ predicates = "3"
 tempfile = "3"
 proptest = "1"
 insta = { version = "1", features = ["filters"] }
-trycmd = "0.15"
+trycmd = "1.2"
 expectrl = "=0.9.0"
 
 [profile.release]
