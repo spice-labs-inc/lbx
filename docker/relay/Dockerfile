@@ -6,7 +6,7 @@
 # 127.0.0.1 guestfwd target).
 # Base pinned by version and digest so a release rebuilds the same way;
 # Dependabot (.github/dependabot.yml) proposes version and digest updates.
-FROM python:3.14.7-alpine3.24@sha256:9e9fde4d32eedce0b661d9ab91e826b62dddf28e928c230ec55f1866cac66b01
+FROM python:3.14.8-alpine3.24@sha256:f6a589d43c42b9e7f7dc67a12d37132491f362859a5d750607710cc56da3bc72
 COPY relay.py /relay.py
 RUN adduser -D -H -u 65532 relay
 USER relay
