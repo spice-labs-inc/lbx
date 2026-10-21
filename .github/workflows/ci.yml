@@ -63,10 +63,27 @@ jobs:
       # ./build sysbox is a second build of the same size. Set the repository
       # variable LBX_SKIP_IMAGE_BUILD=true to skip sysbox, the image builds
       # and the docker suites when that is too long for a run.
-      - name: Build the relay, docker and sysbox images
+      # A hosted runner has about 13 GB free and the two box images are
+      # about 9 GB each; without this the export of the first image fills
+      # the disk and the runner is shut down mid-step (exit 143). The
+      # preinstalled toolchains the job never uses are the bulk of what
+      # can be freed.
+      - name: Free disk space
         if: ${{ vars.LBX_SKIP_IMAGE_BUILD != 'true' }}
         run: |
           df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift \
+            /usr/local/share/powershell /usr/local/share/chromium \
+            /usr/local/lib/node_modules
+          sudo docker image prune -af >/dev/null
+          sudo apt-get clean
+          df -h /
+
+      - name: Build the relay, docker and sysbox images
+        if: ${{ vars.LBX_SKIP_IMAGE_BUILD != 'true' }}
+        run: |
+          ( while sleep 120; do echo "disk: $(df -h / | tail -1)"; done ) &
           ./build relay
           ./build docker
           ./build sysbox

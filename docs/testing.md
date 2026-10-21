@@ -52,10 +52,12 @@ and the migrate suite included (the hosted runner has passwordless sudo, so
 the root pass and the daemon restarts run there). The suites that need KVM
 (`test_llm_in_a_box_vm.sh`, `verify-vm-e2e.sh`) run in a second job on a
 self-hosted runner labeled `kvm`, only when the repository variable
-`LBX_SELF_HOSTED` is `true`; otherwise that job is skipped. The image
-builds take about half an hour each on a hosted runner; the repository
-variable `LBX_SKIP_IMAGE_BUILD=true` skips the sysbox install, the builds
-and the suites when that is too long.
+`LBX_SELF_HOSTED` is `true`; otherwise that job is skipped. The job frees the
+preinstalled toolchains it does not use before the builds, because a
+hosted runner starts with about 13 GB free and each box image is about
+9 GB. The image builds take about half an hour each on a hosted runner;
+the repository variable `LBX_SKIP_IMAGE_BUILD=true` skips the sysbox
+install, the builds and the suites when that is too long.
 
 A single suite still runs on its own, for example
 `bash tests/test_llm_in_a_box_sessions.sh`.
