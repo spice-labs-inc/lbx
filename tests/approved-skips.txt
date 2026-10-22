@@ -48,3 +48,43 @@ test_llm_in_a_box_vm.sh|L7b: the default
 test_llm_in_a_box_vm.sh|L8: free-space
 test_llm_in_a_box_vm.sh|L8b: the warning helpers
 test_llm_in_a_box_vm.sh|L10: with both
+
+# Run-suite checks that drove stand-in tools on PATH (a stub find, stat, dd,
+# mkdir or od) to reach the launcher's link-count, device, claim and signal
+# paths, or that pinned the bash launcher's own shell variables leaking
+# into --env. The Rust launcher spawns only setpriv and docker, does those
+# paths natively (the crate's unit tests cover them) and assigns no such
+# variables, so these checks have nothing to drive and skip.
+test_llm_in_a_box_run.sh|RUN40 a directory on another device
+test_llm_in_a_box_run.sh|RUN44 an existing runs/<name>/.claim
+test_llm_in_a_box_run.sh|RUN45 a runs/<name>/.claim that appears
+test_llm_in_a_box_run.sh|RUN49 --denied never follows a link swapped
+test_llm_in_a_box_run.sh|RUN50 a claim refused by the file system
+test_llm_in_a_box_run.sh|RUN51 a dd without conv=excl
+test_llm_in_a_box_run.sh|RUN52 a device-number scan that fails
+test_llm_in_a_box_run.sh|RUN60 unreadable random bytes
+test_llm_in_a_box_run.sh|RUN61 a runs/<name> that cannot be created
+test_llm_in_a_box_run.sh|RUN76 known limit: --env SESSION
+test_llm_in_a_box_run.sh|RUN80 a runs/ directory that cannot be created
+test_llm_in_a_box_run.sh|RUN82 known limit: any variable the launcher assigns
+test_llm_in_a_box_run.sh|RUN83 a signal during the checks
+test_llm_in_a_box_run.sh|RUN84 a signal during the claim
+test_llm_in_a_box_run.sh|RUN85 a signal to the whole process group
+test_llm_in_a_box_run.sh|RUN86 a second signal before the run starts
+test_llm_in_a_box_run.sh|RUN87 a failed claim with a signal pending
+test_llm_in_a_box_run.sh|RUN88 a failed claim whose clean-up meets
+test_llm_in_a_box_run.sh|RUN89 a process-group signal while runs/ is created
+test_llm_in_a_box_run.sh|RUN90 a failed claim whose runs/<name> is no longer empty
+test_llm_in_a_box_run.sh|RUN91 a runs/ created by a concurrent run
+test_llm_in_a_box_run.sh|RUN92 a state directory created for a claim
+test_llm_in_a_box_run.sh|RUN94 a failed or signalled claim below a missing parent
+test_llm_in_a_box_run.sh|RUN95 a process-group signal while the state directory
+test_llm_in_a_box_run.sh|RUN96 a runs/ that cannot be created in a new state directory
+
+# Virtual-machine checks that need qemu and /dev/kvm. They skip wherever
+# /dev/kvm is absent, which includes GitHub-hosted runners.
+test_llm_in_a_box_vm.sh|stale-pidfile attach + /data landing checks
+test_llm_in_a_box_sessions.sh|existing vm session is attached to instead of re-launched
+test_llm_in_a_box_sessions.sh|vm relaunch mounts the RECORDED origin directory
+test_llm_in_a_box_sessions.sh|legacy vm session (no origin file) mounts the current pwd
+test_llm_in_a_box_sessions.sh|versioned-base session checks

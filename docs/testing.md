@@ -214,8 +214,12 @@ kernel that decides a socket connection by the server's host path they skip
 for that reason instead (VRUN30 and VRUN31 pin the two measured behaviors
 those checks cannot reach); the vm suite's inverted gate, which asserts what
 happens when no llm-in-a-box image exists and so cannot run on a host that
-has just built the images; and the checks that sourced the old bash launcher
-and now live in the crate's Rust tests. Each line says why.
+has just built the images; the checks that sourced the old bash launcher
+and now live in the crate's Rust tests; the run-suite checks that drove
+stand-in tools on PATH (a stub find, stat, dd, mkdir or od) or pinned the
+bash launcher's own shell variables, which the Rust launcher never runs or
+assigns; and the vm checks that need /dev/kvm, absent on GitHub-hosted
+runners. Each line says why.
 
 ## Where results appear
 
