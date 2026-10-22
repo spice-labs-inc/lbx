@@ -42,22 +42,22 @@ local run on a laptop is expected to be red. The launcher under test is
 named with `--lbx <path>` or the `LBX_BIN` variable (default: the `lbx` on
 `PATH`).
 
-Continuous integration (`.github/workflows/ci.yml`) runs on GitHub-hosted
-`ubuntu-24.04` runners: `cargo fmt --check`, `cargo clippy`, `cargo test`,
-then it installs sysbox (the `fuse3` package and sysbox-ce 0.7.1 from
-downloads.nestybox.com, waiting until docker lists the `sysbox-runc`
-runtime), builds the relay, docker and sysbox images, and runs every suite
-in `tests/` through `tests/run-all-suites.sh --no-build`, the sysbox suite
-and the migrate suite included (the hosted runner has passwordless sudo, so
-the root pass and the daemon restarts run there). The suites that need KVM
-(`test_llm_in_a_box_vm.sh`, `verify-vm-e2e.sh`) run in a second job on a
-self-hosted runner labeled `kvm`, only when the repository variable
-`LBX_SELF_HOSTED` is `true`; otherwise that job is skipped. The job frees the
-preinstalled toolchains it does not use before the builds, because a
-hosted runner starts with about 13 GB free and each box image is about
-9 GB. The image builds take about half an hour each on a hosted runner;
-the repository variable `LBX_SKIP_IMAGE_BUILD=true` skips the sysbox
-install, the builds and the suites when that is too long.
+Continuous integration (`.github/workflows/ci.yml`) has two jobs. On a
+GitHub-hosted `ubuntu-24.04` runner: `cargo fmt --check`, `cargo clippy`,
+`cargo test` and the suite runner's own test; nothing there needs a docker
+daemon. The suites themselves build the box images (several gigabytes
+each, a Rust toolchain compiled inside) and need a real daemon, sysbox,
+root and /dev/kvm; a hosted runner cannot export images that size (the
+export stalls and the runner is shut down), so they run on a self-hosted
+runner named by the repository variable `LBX_RUNNER_LABELS`, a JSON array
+of runner labels. That job prepares the host with
+`tests/setup-run-test-host.sh`, installs qemu and sysbox-ce 0.7.1 (the
+`fuse3` package too, and it waits until docker lists the `sysbox-runc`
+runtime), builds the launcher and hands everything to
+`tests/run-all-suites.sh`, which builds the relay, docker and sysbox
+images and runs every suite, the vm, sysbox and migrate suites included,
+as the user and again as root. Without the variable the job is skipped,
+and it never runs for a pull request from a fork.
 
 A single suite still runs on its own, for example
 `bash tests/test_llm_in_a_box_sessions.sh`.

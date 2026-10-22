@@ -9,11 +9,11 @@ permissions:
   contents: read
 
 jobs:
+  # Everything that needs no docker daemon: format, lint, the Rust tests
+  # (they drive a fake docker) and the suite runner's own test.
   test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
-    env:
-      LBX_BIN: ${{ github.workspace }}/target/debug/lbx
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -32,6 +32,41 @@ jobs:
       - name: Unit and integration tests
         run: cargo test --locked
 
+      - name: Test the suite runner
+        run: bash tests/test_run_all_suites.sh
+
+  # The suites in tests/ build the box images (several gigabytes each, with
+  # a Rust toolchain compiled inside) and need a real docker daemon, sysbox,
+  # root and /dev/kvm. A GitHub-hosted runner is not enough: the image
+  # export stalls and the runner is shut down. They run on a self-hosted
+  # runner instead, named by the repository variable LBX_RUNNER_LABELS (a
+  # JSON array of labels, for example ["self-hosted","linux"]). Without the
+  # variable the job is skipped, as it is for a pull request from a fork:
+  # self-hosted runners never run code from outside this repository.
+  suites:
+    if: ${{ vars.LBX_RUNNER_LABELS != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: ${{ fromJSON(vars.LBX_RUNNER_LABELS || '["self-hosted"]') }}
+    timeout-minutes: 180
+    env:
+      LBX_BIN: ${{ github.workspace }}/target/debug/lbx
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Join the kvm group
+        run: sudo usermod -aG kvm "$USER"
+
+      - name: Prepare the unattended-run test host
+        run: sudo tests/setup-run-test-host.sh "$USER"
+
+      - name: Install test prerequisites
+        run: |
+          sudo apt-get update -q
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
+            qemu-system-x86 qemu-utils rsync e2fsprogs procps iproute2 python3 curl openssh-client jq
+
       # sysbox, for the suites that drive it: the sysbox runtime suite, the
       # migration suite and T18 of the sessions suite exercise the real
       # runtime and skip without it, and a skip that is not approved fails
@@ -41,11 +76,10 @@ jobs:
       # release that declares the `time` Linux namespace, without which
       # containerd 2.x (Docker 28+) cannot create a container at all.
       - name: Install sysbox
-        if: ${{ vars.LBX_SKIP_IMAGE_BUILD != 'true' }}
         run: |
           set -euo pipefail
           SYSBOX_VERSION=0.7.1
-          sudo apt-get install -y -q --no-install-recommends fuse3
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends fuse3
           curl -fsSL -o /tmp/sysbox-ce.deb \
             "https://downloads.nestybox.com/sysbox/releases/v${SYSBOX_VERSION}/sysbox-ce_${SYSBOX_VERSION}-0.linux_amd64.deb"
           sudo dpkg -i /tmp/sysbox-ce.deb
@@ -58,39 +92,20 @@ jobs:
           done
           docker info --format '{{json .Runtimes}}'
 
-      # ./build docker takes about half an hour on a hosted runner (Rust
-      # toolchain, JDK, Node, the agents) and the image is several gigabytes;
-      # ./build sysbox is a second build of the same size. Set the repository
-      # variable LBX_SKIP_IMAGE_BUILD=true to skip sysbox, the image builds
-      # and the docker suites when that is too long for a run.
-      # A hosted runner has about 13 GB free and the two box images are
-      # about 9 GB each; without this the export of the first image fills
-      # the disk and the runner is shut down mid-step (exit 143). The
-      # preinstalled toolchains the job never uses are the bulk of what
-      # can be freed.
-      - name: Free disk space
-        if: ${{ vars.LBX_SKIP_IMAGE_BUILD != 'true' }}
-        run: |
-          df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift \
-            /usr/local/share/powershell /usr/local/share/chromium \
-            /usr/local/lib/node_modules
-          sudo docker image prune -af >/dev/null
-          sudo apt-get clean
-          df -h /
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
 
-      - name: Build the relay, docker and sysbox images
-        if: ${{ vars.LBX_SKIP_IMAGE_BUILD != 'true' }}
-        run: |
-          ( while sleep 120; do echo "disk: $(df -h / | tail -1)"; done ) &
-          ./build relay
-          ./build docker
-          ./build sysbox
+      - name: Build the launcher
+        run: cargo build --locked
 
-      - name: Docker and sysbox suites
-        if: ${{ vars.LBX_SKIP_IMAGE_BUILD != 'true' }}
-        run: tests/run-all-suites.sh --no-build --lbx target/debug/lbx --logs test-logs
+      # The runner builds the images itself (relay, docker, and sysbox when
+      # the runtime is there) after the vm suite's unbuilt-image check, then
+      # runs every suite as the user and the root-only ones again as root.
+      - name: Build the images and run the suites
+        run: |
+          df -h / /tmp
+          ( while sleep 120; do echo "disk: $(df -h / | tail -1)  mem: $(free -m | awk '/Mem:/{print $7" MB free"}')"; done ) &
+          sudo --preserve-env -u "$USER" tests/run-all-suites.sh --lbx target/debug/lbx --logs test-logs
 
       - name: Job summary
         if: always()
@@ -104,36 +119,3 @@ jobs:
           path: test-logs/
           retention-days: 14
           if-no-files-found: ignore
-
-  # The vm suite and the vm end-to-end check need /dev/kvm, the kvm group and
-  # qemu, which GitHub-hosted runners do not provide. They run on a
-  # self-hosted runner labeled kvm, and only when the repository variable
-  # LBX_SELF_HOSTED is "true"; a fork or a checkout without such a runner
-  # skips this job instead of waiting forever for a runner to pick it up.
-  # The sysbox suite runs in the hosted job above, where sysbox is installed.
-  kvm-and-sysbox:
-    if: ${{ vars.LBX_SELF_HOSTED == 'true' }}
-    runs-on: [self-hosted, kvm]
-    timeout-minutes: 180
-    env:
-      LBX_BIN: ${{ github.workspace }}/target/debug/lbx
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - name: Build the launcher
-        run: cargo build --locked
-
-      - name: Build the images and the vm base disk
-        run: |
-          ./build relay
-          ./build docker
-          ./build vm
-
-      - name: VM suite
-        run: bash tests/test_llm_in_a_box_vm.sh
-
-      - name: VM end to end
-        run: bash tests/verify-vm-e2e.sh

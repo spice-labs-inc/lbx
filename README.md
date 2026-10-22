@@ -322,9 +322,9 @@ the `kvm` group; `test_llm_in_a_box_sysbox.sh` and
 restart its daemons (the migrate suite also needs root or passwordless sudo,
 so the runner repeats it in the root pass). A check that skips without being
 listed in `tests/approved-skips.txt` fails the run. CI runs `cargo fmt`,
-`cargo clippy`, `cargo test`, then installs sysbox and runs the docker,
-sysbox and migrate suites on hosted runners; the vm suites run on a
-self-hosted runner when the repository enables it.
+`cargo clippy` and `cargo test` on hosted runners; the suites, which build
+the images and need sysbox, root and KVM, run on a self-hosted runner the
+repository names.
 See [docs/testing.md](docs/testing.md).
 
 ## Documentation
