@@ -167,7 +167,8 @@ host_stat() {
 # sudo inside the box, as the box user, using the NUMERIC form (see the
 # LLM-FRIENDLY NOTE above).
 box_sudo_works() {
-    docker exec -u 1000:1000 "$1" sudo -n true >/dev/null 2>&1
+    # The box user carries the host uid and gid (HOST_UID/HOST_GID), not 1000.
+    docker exec -u "$(id -u):$(id -g)" "$1" sudo -n true >/dev/null 2>&1
 }
 
 # The launcher's own output for an attach/start attempt. Run from a
@@ -477,7 +478,7 @@ else
             box_sudo_works "$BOX" || SYS7_IDENTITY_OK=false
             [ "$(box_stat "$BOX" /etc/sudo.conf)" = "0 0 644" ] || SYS7_IDENTITY_OK=false
             docker exec -u 0 "$BOX" grep -q 'NOPASSWD' /etc/sudoers.d/agent 2>/dev/null || SYS7_IDENTITY_OK=false
-            docker exec -u 0 "$BOX" id 1000 >/dev/null 2>&1 || SYS7_IDENTITY_OK=false
+            docker exec -u 0 "$BOX" id "$(id -u)" >/dev/null 2>&1 || SYS7_IDENTITY_OK=false
         done
         check "SYS7 across $SYS7_CYCLES start/stop cycles no cycle re-runs the user rename (no new failure line)" \
             "[ \"\$SYS7_NO_NEW_FAILURE\" = true ]"

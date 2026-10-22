@@ -67,6 +67,8 @@ jobs:
           sudo docker image prune -af >/dev/null
           sudo apt-get clean
           df -h /
+          # The unattended-run check wants alpine:3, which the prune removed.
+          docker pull -q alpine:3
 
       - name: Prepare the unattended-run test host
         run: sudo tests/setup-run-test-host.sh "$USER"
@@ -116,8 +118,12 @@ jobs:
           DOCKER_BUILDKIT: "0"
         run: |
           df -h / /tmp
+          echo "user $(id) umask $(umask)"
+          # The runner process starts with a group-writable umask; lbx refuses
+          # a config file others can write, as a user's shell would not make.
+          umask 022
           ( while sleep 120; do echo "disk: $(df -h / | tail -1)  mem: $(free -m | awk '/Mem:/{print $7" MB free"}')"; done ) &
-          sudo --preserve-env -u "$USER" tests/run-all-suites.sh --lbx target/debug/lbx --logs test-logs
+          tests/run-all-suites.sh --lbx target/debug/lbx --logs test-logs
 
       - name: Job summary
         if: always()
