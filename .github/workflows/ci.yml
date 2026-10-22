@@ -36,16 +36,15 @@ jobs:
         run: bash tests/test_run_all_suites.sh
 
   # The suites in tests/ build the box images (several gigabytes each, with
-  # a Rust toolchain compiled inside) and need a real docker daemon, sysbox,
-  # root and /dev/kvm. A GitHub-hosted runner is not enough: the image
-  # export stalls and the runner is shut down. They run on a self-hosted
-  # runner instead, named by the repository variable LBX_RUNNER_LABELS (a
-  # JSON array of labels, for example ["self-hosted","linux"]). Without the
-  # variable the job is skipped, as it is for a pull request from a fork:
-  # self-hosted runners never run code from outside this repository.
+  # a Rust toolchain compiled inside) and need a real docker daemon, sysbox
+  # and root. A hosted runner has 4 cores and 16 GB; BuildKit's final
+  # "exporting layers" step of a 9 GB image stalled there twice and the
+  # runner was shut down, so the images are built with the classic builder
+  # (DOCKER_BUILDKIT=0), which commits each layer as its instruction
+  # finishes. The vm suite needs /dev/kvm, which hosted runners do not have;
+  # its checks are approved skips.
   suites:
-    if: ${{ vars.LBX_RUNNER_LABELS != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
-    runs-on: ${{ fromJSON(vars.LBX_RUNNER_LABELS || '["self-hosted"]') }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 180
     env:
       LBX_BIN: ${{ github.workspace }}/target/debug/lbx
@@ -55,8 +54,19 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Join the kvm group
-        run: sudo usermod -aG kvm "$USER"
+      # A hosted runner starts with about 13 GB free and the images need
+      # more; the preinstalled toolchains the job never uses are the bulk
+      # of what can be freed.
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift \
+            /usr/local/share/powershell /usr/local/share/chromium \
+            /usr/local/lib/node_modules
+          sudo docker image prune -af >/dev/null
+          sudo apt-get clean
+          df -h /
 
       - name: Prepare the unattended-run test host
         run: sudo tests/setup-run-test-host.sh "$USER"
@@ -65,7 +75,7 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
-            qemu-system-x86 qemu-utils rsync e2fsprogs procps iproute2 python3 curl openssh-client jq
+            qemu-utils rsync e2fsprogs procps iproute2 python3 curl openssh-client jq
 
       # sysbox, for the suites that drive it: the sysbox runtime suite, the
       # migration suite and T18 of the sessions suite exercise the real
@@ -99,9 +109,11 @@ jobs:
         run: cargo build --locked
 
       # The runner builds the images itself (relay, docker, and sysbox when
-      # the runtime is there) after the vm suite's unbuilt-image check, then
-      # runs every suite as the user and the root-only ones again as root.
+      # the runtime is there), then runs every suite as the user and the
+      # root-only ones again as root.
       - name: Build the images and run the suites
+        env:
+          DOCKER_BUILDKIT: "0"
         run: |
           df -h / /tmp
           ( while sleep 120; do echo "disk: $(df -h / | tail -1)  mem: $(free -m | awk '/Mem:/{print $7" MB free"}')"; done ) &

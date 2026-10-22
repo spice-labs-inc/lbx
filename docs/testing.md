@@ -42,22 +42,20 @@ local run on a laptop is expected to be red. The launcher under test is
 named with `--lbx <path>` or the `LBX_BIN` variable (default: the `lbx` on
 `PATH`).
 
-Continuous integration (`.github/workflows/ci.yml`) has two jobs. On a
-GitHub-hosted `ubuntu-24.04` runner: `cargo fmt --check`, `cargo clippy`,
-`cargo test` and the suite runner's own test; nothing there needs a docker
-daemon. The suites themselves build the box images (several gigabytes
-each, a Rust toolchain compiled inside) and need a real daemon, sysbox,
-root and /dev/kvm; a hosted runner cannot export images that size (the
-export stalls and the runner is shut down), so they run on a self-hosted
-runner named by the repository variable `LBX_RUNNER_LABELS`, a JSON array
-of runner labels. That job prepares the host with
-`tests/setup-run-test-host.sh`, installs qemu and sysbox-ce 0.7.1 (the
-`fuse3` package too, and it waits until docker lists the `sysbox-runc`
-runtime), builds the launcher and hands everything to
-`tests/run-all-suites.sh`, which builds the relay, docker and sysbox
-images and runs every suite, the vm, sysbox and migrate suites included,
-as the user and again as root. Without the variable the job is skipped,
-and it never runs for a pull request from a fork.
+Continuous integration (`.github/workflows/ci.yml`) runs two jobs on
+GitHub-hosted `ubuntu-24.04` runners. The first is quick and needs no
+docker daemon: `cargo fmt --check`, `cargo clippy`, `cargo test` and the
+suite runner's own test. The second runs the suites: it frees the disk
+space the preinstalled toolchains take (a hosted runner starts with about
+13 GB free), prepares the host with `tests/setup-run-test-host.sh`,
+installs sysbox-ce 0.7.1 (the `fuse3` package too, and it waits until
+docker lists the `sysbox-runc` runtime), builds the launcher and hands
+everything to `tests/run-all-suites.sh`, which builds the relay, docker and
+sysbox images and runs every suite as the user and again as root. The
+images are built with the classic builder (`DOCKER_BUILDKIT=0`): a hosted
+runner has 4 cores and 16 GB, and BuildKit's final export of a 9 GB image
+stalled there until the runner was shut down. Hosted runners have no
+/dev/kvm, so the vm suite's checks skip; those skips are approved.
 
 A single suite still runs on its own, for example
 `bash tests/test_llm_in_a_box_sessions.sh`.
