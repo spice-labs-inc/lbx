@@ -1,20 +1,20 @@
 name: Release
 
-# On a tag vX.Y.Z: build the launcher as a static Linux binary, attach it
-# and its checksum to a GitHub release of that tag, and write the block a
-# downstream consumer parses into the release body. Nothing is pushed to an
-# image registry; the box images are built locally with ./build.
+# When a GitHub release vX.Y.Z is published (gh release create vX.Y.Z
+# --generate-notes): build the launcher as a static Linux binary, attach it
+# and its checksum to the release, and append the block a downstream
+# consumer parses to the release notes. Nothing is pushed to an image
+# registry; the box images are built locally with ./build.
 
 on:
-  push:
-    tags:
-      - "v*"
+  release:
+    types: [published]
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref_name }}
+  group: release-${{ github.event.release.tag_name }}
   cancel-in-progress: false
 
 jobs:
@@ -25,21 +25,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.release.tag_name }}
           persist-credentials: false
 
-      # A release tag is vMAJOR.MINOR.PATCH: three decimal numbers without
-      # leading zeros and no suffix. Anything else stops here, before a
-      # build or a release exists.
-      - name: Check the tag
+      - name: Validate tag
+        id: validate
         env:
-          TAG: ${{ github.ref_name }}
+          # tag_name is "vX.Y.Z" (no refs/tags/ prefix) for the release event.
+          TAG_NAME: ${{ github.event.release.tag_name }}
         run: |
-          case "$TAG" in
-            v0.*|v[1-9]*) ;;
-            *) echo "refusing tag '$TAG': a release tag is vMAJOR.MINOR.PATCH" >&2; exit 1 ;;
-          esac
-          echo "$TAG" | LC_ALL=C grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \
-            || { echo "refusing tag '$TAG': a release tag is vMAJOR.MINOR.PATCH (for example v0.1.0)" >&2; exit 1; }
+          if [[ "${TAG_NAME}" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "VERSION=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tag does not match semantic version pattern v*.*.* (got: ${TAG_NAME})" >&2
+            exit 1
+          fi
 
       - name: Rust toolchain
         run: |
@@ -58,24 +58,24 @@ jobs:
 
       - name: Release notes
         env:
-          TAG: ${{ github.ref_name }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
           COMMIT: ${{ github.sha }}
         run: |
           {
             echo "<!-- llm-in-a-box release: begin -->"
-            echo "- Tag: $TAG"
+            echo "- Tag: $TAG_NAME"
             echo "- Commit: $COMMIT"
             echo "- Binary: lbx-x86_64-unknown-linux-musl (sha256 in lbx-x86_64-unknown-linux-musl.sha256)"
             echo "<!-- llm-in-a-box release: end -->"
           } > release-notes.md
           cat release-notes.md
 
-      - name: Create the GitHub release
+      - name: Attach the binary and the notes to the release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
+          tag_name: ${{ github.event.release.tag_name }}
           body_path: release-notes.md
+          append_body: true
           files: |
             lbx-x86_64-unknown-linux-musl
             lbx-x86_64-unknown-linux-musl.sha256

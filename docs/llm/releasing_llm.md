@@ -4,11 +4,12 @@ Human version: [../releasing.md](../releasing.md).
 
 ## Facts
 
-- A release is a GitHub release of the launcher binary, made by
-  `.github/workflows/release.yml` on a pushed tag `v*`. No image is
+- A release is a GitHub release (`gh release create vX.Y.Z --generate-notes`);
+  `.github/workflows/release.yml` runs when it is published, attaches the
+  launcher binary and appends the notes block. No image is
   published anywhere; every host builds the box images with `./build`.
-- Tag format: `^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`, C
-  locale. The workflow refuses any other `v*` tag before it builds. First
+- Tag format: `^v([0-9]+\.[0-9]+\.[0-9]+)$`. The workflow refuses any other
+  tag before it builds. First
   release v0.1.0. Pre-1.0: breaking = minor bump.
 - Build: `rustup target add x86_64-unknown-linux-musl`; `cargo build
   --release --locked --target x86_64-unknown-linux-musl`.

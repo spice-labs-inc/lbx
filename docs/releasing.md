@@ -17,9 +17,9 @@ them.
 
 ## Version rules
 
-- A release is a tag `vMAJOR.MINOR.PATCH`: three decimal numbers without
-  leading zeros, nothing before or after (no `-rc.1`, no `+build`). The
-  workflow refuses any other `v*` tag before it builds anything.
+- A release is a GitHub release whose tag is `vMAJOR.MINOR.PATCH`: three
+  decimal numbers, nothing before or after (no `-rc.1`, no `+build`). The
+  workflow refuses any other tag before it builds anything.
 - Before 1.0.0, a breaking change raises the minor number (`v0.1.0` to
   `v0.2.0`), anything else the patch number (`v0.1.0` to `v0.1.1`).
   Breaking means a change to any of: the `lbx` command line, exit codes
@@ -30,19 +30,17 @@ them.
 ## How to cut a release
 
 1. Make sure the commit you want is on `main` and its CI run is green.
-2. Tag it and push the tag:
+2. Create the release; this also creates the tag:
 
    ```
-   git tag v0.1.0
-   git push origin v0.1.0
+   gh release create v0.1.0 --generate-notes
    ```
 
-3. Pushing the tag starts `.github/workflows/release.yml`. Watch the
-   "Release" workflow run; when it is green, the release exists with both
-   files attached.
-4. Edit the release on GitHub if you want to add notes above the block:
-   what changed for consumers, and anything breaking. Keep the block as it
-   is.
+3. Publishing the release starts `.github/workflows/release.yml`. Watch
+   the "Release" workflow run; when it is green, the release has both
+   files attached and the block below appended to its notes.
+4. Edit the notes on GitHub if you want to say more above the block: what
+   changed for consumers, and anything breaking. Keep the block as it is.
 
 ## What release.yml does
 
@@ -54,9 +52,9 @@ In order; a failed step stops the job, and nothing after it happens:
 3. `cargo build --release --locked --target x86_64-unknown-linux-musl`.
 4. Copies the binary to `lbx-x86_64-unknown-linux-musl` and writes
    `lbx-x86_64-unknown-linux-musl.sha256` with `sha256sum`.
-5. Writes the release body (the block below) and creates the GitHub
-   release for the tag with both files attached
-   (`softprops/action-gh-release`). The job fails if a file is missing.
+5. Writes the block below, appends it to the release notes and attaches
+   both files to the release (`softprops/action-gh-release`). The job
+   fails if a file is missing.
 
 ### The release notes block
 
