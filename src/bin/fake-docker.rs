@@ -226,6 +226,17 @@ fn main() {
     }
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
     let code = match a.as_slice() {
+        ["image", "inspect", "--format", "{{.Id}}", _] => {
+            // The image's content id. Unset means "docker cannot report
+            // one": the launcher skips the content-identity compare.
+            match std::env::var("FAKE_IMAGE_ID") {
+                Ok(id) => {
+                    println!("{id}");
+                    0
+                }
+                Err(_) => 1,
+            }
+        }
         ["image", "inspect", "--format", "{{.Config.User}}", _] => {
             match std::env::var("FAKE_IMAGE_USER") {
                 Ok(u) => {

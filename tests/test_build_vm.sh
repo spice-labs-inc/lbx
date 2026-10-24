@@ -70,11 +70,11 @@ skip() {
     SKIP=$((SKIP + 1))
 }
 
-# The fake qemu shim used by the sessions suite must not leak into this
-# suite: the build's running-vm guard keys on pgrep qemu-system-x86_64,
-# and a leftover qshim would falsely trip it (observed 2026-09-03).
-pkill -f 'llm-in-a-box-qshim' 2>/dev/null || true
-pkill -f 'qemu-system-x86_64.*/tmp/llm-in-a-box-vm' 2>/dev/null || true
+# A leftover fake qemu from the sessions suite (`qshim`) is harmless for
+# THIS suite now that the running-session advisory reads the launcher's own
+# qemu.pid records instead of `pgrep -f qemu-system-x86_64` — but a real,
+# unrelated qemu on the host must still not trip the advisory (pinned by the
+# dead-pidfile check below).
 
 # Requirement: --check must not build, must print a PASS/FAIL status for the
 # vm build prereqs, and must exit 0 when they are all present. The ONLY host
@@ -138,7 +138,7 @@ cat > "$SHIMDIR/docker" <<'SHIMEOF'
 #!/usr/bin/env bash
 cmd="$1"; shift
 case "$cmd" in
-    build) exit 0 ;;
+    build) printf 'BUILD %s\n' "$*" >> "$SHIMLOG"; exit 0 ;;
     create) echo cid123 ;;
     rm) exit 0 ;;
     image)
@@ -274,24 +274,32 @@ check "a docker build that reports success but leaves no image fails with a clea
 # directory and `latest` moves; running sessions keep their old base. The
 # build prints an advisory instead of failing (the old in-place rebuild
 # conflicted with qemu's write lock; versioned bases remove the conflict).
-spawn_guard_qemu() {
-    bash -c 'exec -a qemu-system-x86_64 sh -c "trap \"exit 0\" TERM INT; while :; do sleep 0.1; done" x /tmp/llm-in-a-box-build-guard/overlay.qcow2' >/dev/null 2>&1 </dev/null &
-    echo $!
-}
-
-rm -rf /tmp/llm-in-a-box-build-guard && mkdir -p /tmp/llm-in-a-box-build-guard
-GUARD_PID=$(spawn_guard_qemu)
-sleep 0.5
+# AMENDED 2026-10-24: "running" is the launcher's own record
+# (sessions/<name>/qemu.pid with a live pid), not `pgrep -f
+# qemu-system-x86_64`, which matched any qemu on the host. The fixture is
+# therefore a pidfile, and the pid is probed for liveness: a stale pidfile
+# (what `lbx --shutdown` leaves behind) must NOT print the advisory.
 rm -rf "$FIXTMP"
-mkdir -p "$FIXTMP/proj"
+mkdir -p "$FIXTMP/proj" "$FIXTMP/state/sessions/guard"
+sleep 30 &
+GUARD_PID=$!
+printf '%s\n' "$GUARD_PID" > "$FIXTMP/state/sessions/guard/qemu.pid"
 check "a running vm session no longer blocks the build (advisory + new base staged)" \
     "cd $FIXTMP/proj && LLMBOX_STATE_DIR=$FIXTMP/state SHIMLOG=$SHIMLOG PATH=$SHIMDIR:\$PATH bash '$BUILD' vm >/tmp/llm-in-a-box-bd3.log 2>&1; [ \$? -eq 0 ] \
         && grep -q 'vm session is running' /tmp/llm-in-a-box-bd3.log \
         && grep -q 'keep using' /tmp/llm-in-a-box-bd3.log \
+        && grep -q 'guard' /tmp/llm-in-a-box-bd3.log \
         && [ -L $FIXTMP/state/bases/latest ] \
         && [ -f \$(readlink -f $FIXTMP/state/bases/latest)/base.qcow2 ]"
 kill "$GUARD_PID" 2>/dev/null || true
-rm -rf /tmp/llm-in-a-box-build-guard
+wait "$GUARD_PID" 2>/dev/null || true
+# A dead pid in qemu.pid is a session that is NOT running: no advisory. This
+# is also the proof that an unrelated qemu process can no longer trip it.
+DEAD_PID=$GUARD_PID
+printf '%s\n' "$DEAD_PID" > "$FIXTMP/state/sessions/guard/qemu.pid"
+check "a stale qemu.pid (dead session) prints no running-session advisory" \
+    "cd $FIXTMP/proj && LLMBOX_STATE_DIR=$FIXTMP/state SHIMLOG=$SHIMLOG PATH=$SHIMDIR:\$PATH bash '$BUILD' vm >/tmp/llm-in-a-box-bd3b.log 2>&1; [ \$? -eq 0 ] \
+        && ! grep -q 'vm session is running' /tmp/llm-in-a-box-bd3b.log"
 
 # Requirement (2026-09-03, GC phase): after a successful build, old base
 # directories that NO session overlay references are removed; referenced
@@ -336,9 +344,67 @@ if command -v qemu-img >/dev/null 2>&1; then
             && grep -q 'GC: skipped' /tmp/llm-in-a-box-bd5.log \
             && [ -d $FIXGC2/state/bases/unreferenced ]"
     rm -rf "$FIXGC2"
+
+    # Regression (2026-10-24, owner report): a RUNNING session holds a write
+    # lock on its overlay. A plain read-only `qemu-img info` asks the lock
+    # manager for a shared lock and fails
+    # ("Failed to get shared \"write\" lock"), which was indistinguishable
+    # from a damaged overlay — so every rebuild with a vm session running
+    # printed "GC: skipped" and collected nothing. Real lock, no shim:
+    # qemu-io (same qemu-utils package as qemu-img) holds the image write-
+    # locked while its stdin stays open. The precondition inside the check
+    # proves the lock is really held, so this cannot pass vacuously.
+    if command -v qemu-io >/dev/null 2>&1; then
+        FIXGC3=/tmp/llm-in-a-box-build-gc3
+        rm -rf "$FIXGC3"
+        make_base_fixture "$FIXGC3"
+        sleep 15 | qemu-io -f qcow2 "$FIXGC3/state/sessions/foo/overlay.qcow2" >/dev/null 2>&1 &
+        LOCK_PID=$!
+        sleep 1
+        check "a locked (running-session) overlay does not disable GC" \
+            "cd $FIXGC3 && ! qemu-img info $FIXGC3/state/sessions/foo/overlay.qcow2 >/dev/null 2>&1 \
+                && LLMBOX_STATE_DIR=$FIXGC3/state SHIMLOG=$SHIMLOG PATH=$SHIMDIR:\$PATH bash '$BUILD' vm >/tmp/llm-in-a-box-bd6.log 2>&1 \
+                && [ ! -d $FIXGC3/state/bases/unreferenced ] \
+                && [ -d $FIXGC3/state/bases/old1 ] \
+                && [ ! -d $FIXGC3/state/bases/old2 ] \
+                && ! grep -q 'GC: skipped' /tmp/llm-in-a-box-bd6.log \
+                && grep -q 'GC: removed 2' /tmp/llm-in-a-box-bd6.log"
+        kill "$LOCK_PID" 2>/dev/null || true
+        pkill -f "qemu-io -f qcow2 $FIXGC3" 2>/dev/null || true
+        rm -rf "$FIXGC3"
+    else
+        echo "[INFO] locked-overlay GC check not run: qemu-io not installed"
+    fi
 else
     skip "GC checks (qemu-img not installed)"
 fi
+
+# Requirement (2026-10-24): `all` is the "this machine is ready" command and
+# its help text says "all of the above". That must include the netwall relay
+# (it used to stop at sysbox+docker+vm, so a fresh host had no relay image and
+# the netwall path failed at runtime), and it must REBUILD the vm image
+# instead of reusing whatever tag happens to exist: a base disk is only as new
+# as the rootfs it was built from, while the other three builds here run
+# --no-cache. `./build vm` alone keeps the cheap reuse path.
+ALLLOG=/tmp/llm-in-a-box-ball.log
+rm -rf /tmp/llm-in-a-box-build-all && mkdir -p /tmp/llm-in-a-box-build-all/proj
+: > "$SHIMLOG"
+check "./build all builds the relay and rebuilds the reusable vm image" \
+    "cd /tmp/llm-in-a-box-build-all/proj && LLMBOX_STATE_DIR=/tmp/llm-in-a-box-build-all/state SHIMLOG=$SHIMLOG PATH=$SHIMDIR:\$PATH bash '$BUILD' all >$ALLLOG 2>&1; [ \$? -eq 0 ] \
+        && grep -q 'BUILD .*-t llm-in-a-box:sysbox ' $SHIMLOG \
+        && grep -q 'BUILD .*-t llm-in-a-box:docker ' $SHIMLOG \
+        && grep -q 'BUILD .*-t llm-in-a-box-relay:latest' $SHIMLOG \
+        && grep -q 'BUILD .*-t llm-in-a-box:vm ' $SHIMLOG \
+        && [ -f /tmp/llm-in-a-box-build-all/state/bases/\$(readlink /tmp/llm-in-a-box-build-all/state/bases/latest)/base.qcow2 ]"
+
+# ... and `./build vm` on its own still reuses the image (no 40-minute rebuild
+# for someone who only wants a fresh base disk).
+: > "$SHIMLOG"
+check "./build vm alone still reuses an existing vm image (no image build)" \
+    "cd /tmp/llm-in-a-box-build-all/proj && LLMBOX_STATE_DIR=/tmp/llm-in-a-box-build-all/state SHIMLOG=$SHIMLOG PATH=$SHIMDIR:\$PATH bash '$BUILD' vm >/tmp/llm-in-a-box-bvm-reuse.log 2>&1; [ \$? -eq 0 ] \
+        && ! grep -q 'BUILD .*-t llm-in-a-box:vm ' $SHIMLOG \
+        && grep -q 'image build skipped' /tmp/llm-in-a-box-bvm-reuse.log"
+rm -rf /tmp/llm-in-a-box-build-all
 
 echo ""
 echo "test_build_vm.sh: ${PASS} passed, ${FAIL} failed, ${SKIP} skipped"

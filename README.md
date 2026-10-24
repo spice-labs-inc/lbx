@@ -53,6 +53,10 @@ newgrp docker
    ./build docker
    ```
 
+   `./build all` builds everything instead — the sysbox, docker, netwall
+   relay and vm images, and a fresh vm base disk — which is what a machine
+   that runs all three runtimes wants.
+
 3. Launch a session from your project directory and start an agent inside
    it. The current directory is mounted at `/data`; the in-box user is your
    host user, remapped to your uid and gid; the prompt shows the runtime.
@@ -135,11 +139,18 @@ kernel and its own docker daemon. Host prerequisites:
 | ssh key | `ls ~/.ssh/*.pub` | `ssh-keygen` |
 | docker (build only) | `command -v docker` | see above |
 
-`./build vm` builds the `llm-in-a-box:vm` image and then a bootable base
-disk from it, inside a root docker container (no host sudo, no host
-`mkfs`), into the launcher's state directory
-(`~/.llm-in-a-box/bases/<timestamp>/`, with `bases/latest`). Base disks are
-immutable and versioned; a rebuild never touches a running session. The
+`./build vm` builds a bootable base disk from the configured vm image,
+inside a root docker container (no host sudo, no host `mkfs`), into the
+launcher's state directory (`~/.llm-in-a-box/bases/<timestamp>/`, with
+`bases/latest`). Base disks are immutable and versioned; a rebuild never
+touches a running session. The vm **image** itself is reused when it
+already exists (`./build vm` does not rebuild `llm-in-a-box:vm`; a full
+build takes 30 to 40 minutes), so a base disk is only as new as that image:
+`./build all` is the full-rebuild command, and it builds the sysbox, docker,
+relay and vm images and then a fresh base disk from the new vm image. Every
+base disk records where it came from in `bases/<timestamp>/from-image` — the
+image ref and its id — and `lbx --runtime vm` warns when the configured image
+no longer matches, which is what catches a base built before a rebuild. The
 build's scratch directory, where the root filesystem is unpacked and the
 30 GB base disk is filled with it, needs roughly twice the rootfs size and
 is a `/tmp` scratch by default. Set `LBX_VM_BUILD_WORK` to put it on another

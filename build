@@ -8,8 +8,11 @@
 #   sysbox   Build image for sysbox (requires docker)
 #   docker   Build image for plain Docker (requires docker)
 #   vm       Build image for the KVM VM runtime AND the bootable base disk
-#            (requires docker + qemu-img + mkfs.ext4 + sudo)
-#   all      Build all of the above
+#            (requires docker; the base-disk pipeline runs in the image)
+#   relay    Build the netwall relay image (llm-in-a-box-relay)
+#   all      Build all of the above: sysbox, docker, relay, and the vm image +
+#            base disk. Unlike `./build vm` alone, `all` REBUILDS the vm image
+#            (a base disk is only as new as the rootfs it was built from).
 #
 #   --check  (vm only) run the vm build-prereq checks and exit; does not build.
 #   --label  (relay only, repeatable) add an image label KEY=VALUE to the
@@ -90,9 +93,10 @@ Usage: ./build <sysbox|docker|vm|relay|all> [--check]
 Runtimes:
   sysbox   Build image for sysbox (requires docker)
   docker   Build image for plain Docker (requires docker)
-  vm       Build image + base disk for the KVM VM runtime
+  vm       Build image + base disk for the KVM VM runtime (reuses an
+           existing vm image; 'all' rebuilds it)
   relay    Build the netwall relay image (llm-in-a-box-relay)
-  all      Build all of the above
+  all      Build all of the above, rebuilding the vm image
 
 Options:
   --check  (vm only) run vm build-prereq checks and exit; does not build.
@@ -280,13 +284,23 @@ build_vm_base_disk() {
     # Provenance record (2026-09-14): which image this base was built
     # from. The vm preflight warns when it differs from the currently
     # configured image (CFG30). RepoDigests is empty for locally built
-    # images — fall back to the resolved ref (tag-equality limitation,
-    # stated in the docs).
+    # images — fall back to the resolved ref.
+    #
+    # Content identity (2026-10-24): for a locally built image that ref is
+    # only a TAG, so a rebuild under the same tag was indistinguishable from
+    # the image the base actually came from — `./build all` could produce a
+    # "new" base disk from a stale rootfs with nothing to show for it. The
+    # image id is the content: vm::preflight warns when the configured image
+    # no longer matches it. No id line means docker could not report one
+    # (older bases, unusual clients): the tag compare then applies.
     digest=$(docker image inspect --format '{{.RepoDigests}}' "$IMAGE_VM" 2>/dev/null || true)
     digest=$(printf '%s' "$digest" | tr -d '[]' | cut -d' ' -f1)
     [ -n "$digest" ] || digest="$IMAGE_VM"
-    printf '%s
-' "$digest" > "$staging/from-image"
+    image_id=$(docker image inspect --format '{{.Id}}' "$IMAGE_VM" 2>/dev/null | head -1 || true)
+    {
+        printf '%s\n' "$digest"
+        [ -z "$image_id" ] || printf 'image-id %s\n' "$image_id"
+    } > "$staging/from-image"
 
     echo "==> Building base image '$ts' (this can take a few minutes) ..."
     docker run --rm --entrypoint bash \
@@ -366,26 +380,61 @@ build_vm_base_disk() {
     gc_vm_bases
 }
 
+# ── Running-session advisory (2026-10-24) ────────────────────────────────────
+# Ask the launcher's own session records, not `pgrep -f qemu-system-x86_64`:
+# that pattern matches ANY qemu on the host (another user's, another project, a
+# hand-started one) and says nothing about which session is using which base.
+# The records live in the state directory (ADR 013), one qemu.pid per vm
+# session. A pidfile outlives its process — `lbx --shutdown` returns as soon as
+# the qemu is gone without removing it (session::vm_shutdown) — so the PID is
+# probed for liveness, never the file for existence.
+# Prints the session names, space separated (empty when none is running).
+running_vm_sessions() {
+    local pf pid
+    for pf in "$STATE_DIR"/sessions/*/qemu.pid; do
+        [ -f "$pf" ] || continue
+        pid=$(tr -dc '0-9' <"$pf" 2>/dev/null || true)
+        [ -n "$pid" ] || continue
+        kill -0 "$pid" 2>/dev/null || continue
+        printf '%s ' "$(basename "$(dirname "$pf")")"
+    done
+}
+
 build_vm() {
+    local running force_image="no"
+    # `./build all` passes `rebuild`: it is a full rebuild, and a base disk
+    # built from a REUSED image is silently stale (the other builds in `all`
+    # run with --no-cache, this one used to be skipped whenever the image
+    # existed). `./build vm` alone keeps the cheap path.
+    [ "${1:-}" = rebuild ] && force_image="yes"
     check_vm_prereqs || return 1
     # A running vm session no longer blocks the build: base images are
     # IMMUTABLE and versioned (bases/<ts>/), so a rebuild stages a fresh
     # directory and flips `latest`; running sessions keep using the base
     # their overlays chain to (2026-09-03). Advisory only.
-    if pgrep -f qemu-system-x86_64 >/dev/null 2>&1; then
-        echo "NOTE: a box vm session is running — it will keep using its"
+    running="$(running_vm_sessions)"
+    if [ -n "$running" ]; then
+        echo "NOTE: a box vm session is running (${running% }) — it will keep using its"
         echo "      current base image; new sessions will use the new one."
     fi
-    if docker image inspect "$IMAGE_VM" >/dev/null 2>&1; then
-        echo "NOTE: using configured vm image '$IMAGE_VM' (image build skipped)."
-    elif [ "$IMAGE_VM" = "llm-in-a-box:vm" ]; then
-        # Only the DEFAULT name is auto-built — never build the project
-        # image under a user's tag (silent wrong-image substitution).
-        build_docker_image vm || return 1
-    else
+    if [ "$IMAGE_VM" = "llm-in-a-box:vm" ]; then
+        # Only the DEFAULT name is auto-built — never build the project image
+        # under a user's tag (silent wrong-image substitution).
+        if [ "$force_image" = yes ] || ! docker image inspect "$IMAGE_VM" >/dev/null 2>&1; then
+            build_docker_image vm || return 1
+        else
+            echo "NOTE: using the existing vm image '$IMAGE_VM' (image build skipped —"
+            echo "      ./build all rebuilds it; ./build vm reuses an existing one)."
+        fi
+    elif ! docker image inspect "$IMAGE_VM" >/dev/null 2>&1; then
         echo "ERROR: configured vm image '$IMAGE_VM' is not present locally; pull it first:" >&2
         echo "       docker pull $IMAGE_VM" >&2
         return 1
+    elif [ "$force_image" = yes ]; then
+        echo "NOTE: configured vm image '$IMAGE_VM' is your own tag — never rebuilt here;"
+        echo "      update it yourself (docker build --build-arg RUNTIME_TYPE=vm -t '$IMAGE_VM' .)."
+    else
+        echo "NOTE: using configured vm image '$IMAGE_VM' (image build skipped)."
     fi
     # Toolchain probe (2026-09-14): the base-disk pipeline runs INSIDE the
     # configured image (its bash/tar/qemu-img/mkfs.ext4, as root in a
@@ -405,23 +454,40 @@ build_vm() {
 # garbage when NO session overlay references it and it is not the current
 # `latest`. Overlays and bases live in the same state directory (ADR 013), so
 # the reference scan reads $STATE_DIR/sessions/*/overlay.qcow2 directly.
+# LOCKS (2026-10-24): a RUNNING session's qemu holds a WRITE lock on its
+# overlay. A plain read-only `qemu-img info` still asks the lock manager for a
+# shared lock, gets `Failed to get shared "write" lock`, and looked exactly
+# like a damaged image — so every rebuild with a vm session running skipped GC
+# and no base was ever collected. The scan reads with -U (--force-share),
+# which does not take the lock. -U exists since qemu 4.0; the plain call is
+# kept as the fallback for an older qemu-img on PATH (same fail-safe as
+# before, rather than a misread).
 # Fail-safe: if any overlay's backing reference cannot be read, skip deletions
 # entirely.
 gc_vm_bases() {
     [ -d "$STATE_DIR/bases" ] || return 0
-    local latest_ts refs=() ref d ts in_use removed=0 kept=0
+    local latest_ts refs=() ref d ts in_use removed=0 kept=0 ov info
     latest_ts=$(readlink "$STATE_DIR/bases/latest" 2>/dev/null || true)
+    # Sweep failed-build staging FIRST: it is safe whatever the reference scan
+    # below decides, and the scan's fail-safe `return` used to make the sweep
+    # unreachable exactly when leftovers had piled up (2026-10-24).
+    rm -rf "$STATE_DIR"/bases/*.tmp 2>/dev/null || true
     for ov in "$STATE_DIR"/sessions/*/overlay.qcow2; do
         [ -f "$ov" ] || continue
-        ref=$(qemu-img info "$ov" 2>/dev/null | awk '/^backing file:/ { sub(/^backing file: */, ""); print; exit }')
+        info=$(qemu-img info -U "$ov" 2>&1) || info=$(qemu-img info "$ov" 2>&1) || {
+            # Report WHY: the reason was discarded before, so a held lock was
+            # indistinguishable from a corrupt overlay in the log.
+            echo "GC: skipped — cannot read the backing file of '$ov' (fail-safe: nothing removed): $(printf '%s\n' "$info" | head -1)" >&2
+            return 0
+        }
+        ref=$(printf '%s\n' "$info" | awk '/^backing file:/ { sub(/^backing file: */, ""); print; exit }')
         if [ -z "$ref" ]; then
-            echo "GC: skipped — cannot read the backing file of '$ov' (fail-safe: nothing removed)." >&2
+            # No reference recorded: not one of our overlays. Never guess.
+            echo "GC: skipped — '$ov' records no backing file (fail-safe: nothing removed)." >&2
             return 0
         fi
         refs+=("$ref")
     done
-    # sweep failed-build staging leftovers
-    rm -rf "$STATE_DIR"/bases/*.tmp 2>/dev/null || true
     for d in "$STATE_DIR"/bases/*; do
         [ -d "$d" ] || continue
         # The glob also matches the `latest` SYMLINK; rm -rf on a
@@ -464,11 +530,17 @@ case "$RUNTIME" in
         build_relay
         ;;
     all)
+        # `all` is the "this machine is ready" command: every image, including
+        # the netwall relay, and the vm image is REBUILT rather than reused —
+        # a base disk is only as new as the rootfs it was built from, and the
+        # other three builds here are full --no-cache builds. `./build vm`
+        # alone keeps the cheap path (reuse an existing image).
         failed=0
         if command -v docker &>/dev/null; then
             build_docker_image sysbox || (( ++failed ))
             build_docker_image docker || (( ++failed ))
-            build_vm || (( ++failed ))
+            build_relay || (( ++failed ))
+            build_vm rebuild || (( ++failed ))
         else
             echo "ERROR: docker not found — cannot build any images." >&2
             exit 1

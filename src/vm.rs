@@ -140,6 +140,40 @@ pub fn ensure_state_message(cfg: &Resolved, session: &str, script_dir: &Path) {
     let _ = std::fs::write(&readme, text);
 }
 
+/// The content id (`.Id`) of an image: `None` when docker cannot report one.
+/// `image inspect --format {{.Id}}` is the image's own identity, unlike the
+/// ref, which is only a tag for anything built locally.
+fn image_content_id(image: &str) -> Option<String> {
+    crate::docker::Docker::line(&["image", "inspect", "--format", "{{.Id}}", image])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// A ref that carries a content digest (`repo@sha256:…`) rather than a tag.
+fn is_digest_ref(r: &str) -> bool {
+    r.split_once('@')
+        .is_some_and(|(_, d)| d.starts_with("sha256:"))
+}
+
+/// The first repo digest docker reports for an image (`repo@sha256:…`) — the
+/// form `build` writes into `from-image` when the image has one.
+fn image_repo_digest(image: &str) -> Option<String> {
+    let out = crate::docker::Docker::line(&[
+        "image",
+        "inspect",
+        "--format",
+        "{{.RepoDigests}}",
+        image,
+    ])?;
+    out.trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .split_whitespace()
+        .next()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// The preflight. Exits 1 with guidance on failure; returns the base.
 pub fn preflight(cfg: &Resolved, session: &str, script_dir: &Path) -> Base {
     let Ok(b) = resolve_base(cfg, session) else {
@@ -149,11 +183,51 @@ pub fn preflight(cfg: &Resolved, session: &str, script_dir: &Path) -> Base {
         && let Ok(text) = std::fs::read_to_string(dir.join("from-image"))
     {
         let from = text.lines().next().unwrap_or("").to_string();
-        if !from.is_empty() && from != cfg.image_vm {
-            err(&format!(
-                "WARNING: session base was built from a different image ('{from}') than the currently configured vm image ('{}').",
-                cfg.image_vm
-            ));
+        let recorded_id = text
+            .lines()
+            .find_map(|l| l.strip_prefix("image-id "))
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let current_id = image_content_id(&cfg.image_vm);
+        // Content identity decides when both sides are known (2026-10-24).
+        // The build records the ref (the repo DIGEST when docker reports one)
+        // and, since this change, the image id. Two things made the ref
+        // comparison alone wrong:
+        //   * a rebuild under the same TAG was invisible, so a base disk could
+        //     be silently older than the configuration said, and
+        //   * Docker 29 reports a repo digest even for a locally BUILT image,
+        //     so the 2026-09-14 assumption ("RepoDigests is empty for local
+        //     builds") no longer holds and comparing that digest to the
+        //     configured TAG warned "built from a different image" about a
+        //     base built from exactly that image (measured: docker 29.9.2).
+        // So: ids known -> compare ids (identical content under a renamed ref
+        // is not a difference); otherwise fall back to the ref, resolving the
+        // configured image's digest when the record holds one.
+        match (recorded_id, current_id.as_deref()) {
+            (Some(recorded), Some(current)) if recorded != current => {
+                err(&format!(
+                    "WARNING: session base was built from vm image '{recorded}', but the configured"
+                ));
+                err(&format!(
+                    "         vm image ('{}') is now '{current}' — the base is not what the",
+                    cfg.image_vm
+                ));
+                err("         configuration describes. Rebuild it:  ./build vm");
+            }
+            (Some(_), Some(_)) => {}
+            _ => {
+                if !from.is_empty() && from != cfg.image_vm {
+                    let same = is_digest_ref(&from)
+                        && !is_digest_ref(&cfg.image_vm)
+                        && image_repo_digest(&cfg.image_vm).is_none_or(|d| d == from);
+                    if !same {
+                        err(&format!(
+                            "WARNING: session base was built from a different image ('{from}') than the currently configured vm image ('{}').",
+                            cfg.image_vm
+                        ));
+                    }
+                }
+            }
         }
     }
     ensure_state_message(cfg, session, script_dir);

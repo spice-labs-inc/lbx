@@ -83,6 +83,25 @@ every project pays for its own multi-gigabyte base rebuild.
   session overlay references and that are not `latest`, with the fail-safe
   skip when an overlay's backing file cannot be read; it now inspects
   overlays and bases in the same root.
+- Amended (2026-10-24): the reference scan reads each overlay with
+  `qemu-img info -U` (`--force-share`). A RUNNING session's qemu holds a
+  write lock on its overlay, and a plain read-only open asks for a shared
+  lock and fails — which was indistinguishable from a damaged overlay, so
+  the fail-safe skipped every rebuild while a vm session ran and no base was
+  ever collected. The fail-safe still covers a genuinely unreadable
+  overlay, and the log line now carries `qemu-img`'s reason. The
+  `bases/*.tmp` staging sweep runs before the scan, so a failed build's
+  leftovers are cleaned even when the scan gives up.
+- Amended (2026-10-24): `from-image` records the image **id** next to the
+  ref, and the vm preflight compares ids when both are known, so a rebuild
+  under the same tag is no longer invisible. Two consequences: identical
+  content under a renamed ref is not reported (it is not a difference), and
+  the ref comparison — used only for bases without an id line — resolves a
+  recorded repo digest against the configured image's own digest. That
+  second part exists because Docker 29 reports a repo digest even for a
+  locally BUILT image, so the earlier "RepoDigests is empty for local
+  builds" assumption produced a spurious "built from a different image"
+  warning on every launch (measured against docker 29.9.2).
 - Not migrated: base images and overlays already written into project
   directories are left where they are, for the operator to remove.
 

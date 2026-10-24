@@ -83,6 +83,15 @@ case "$1" in
     image)
         case "$2" in
             inspect)
+                if [ "${3:-}" = "--format" ] && [ "${4:-}" = '{{.Id}}' ]; then
+                    # FAKE_IMAGE_ID (optional): the image's content id. Unset
+                    # means "docker cannot report one": the launcher then
+                    # skips the content-identity compare and only the tag in
+                    # from-image is compared, which is the older behavior.
+                    [ -n "${FAKE_IMAGE_ID:-}" ] || exit 1
+                    printf '%s\n' "$FAKE_IMAGE_ID"
+                    exit 0
+                fi
                 if [ "${3:-}" = "--format" ] && [ "${4:-}" = '{{.RepoDigests}}' ]; then
                     # FAKE_DIGEST (optional): a repo digest; empty by
                     # default (locally built images), which makes the

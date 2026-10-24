@@ -58,6 +58,10 @@
 #         session's base record differs from the configured image
 #   CFG31 config path under a non-searchable parent -> unusable (only
 #         ENOENT is "missing")
+#   CFG36 content-addressed provenance: the from-image record carries the
+#         image id, and the vm preflight warns when a REBUILD under the
+#         same tag no longer matches the base (a tag compare cannot see
+#         that); a base without an id line falls back to the tag
 #
 # WHY: the config file controls which image runs as the session — the
 # single most security-relevant user input in the launcher. Each check
@@ -770,6 +774,89 @@ done
 chmod 600 /tmp/llmcfg-cfg-c35
 [ -z "$cfg35_bad" ] || echo "CFG35 wrong outcomes:$cfg35_bad"
 check "CFG35 group- or other-writable config modes are refused, all others accepted" "[ -z '$cfg35_bad' ]"
+
+# ── CFG36: content-addressed provenance (image id) ─────────────────────────
+# Requirement (2026-10-24, owner report): the ref in `from-image` is only a TAG
+# for a locally built image (`RepoDigests` is empty), so a REBUILD under the
+# same tag used to be invisible — a base disk could be silently older than the
+# configuration says, which is exactly what `./build all` did when it reused an
+# existing `llm-in-a-box:vm`. The build now records `image-id <id>` too, and
+# the vm preflight warns when the configured image's id no longer matches.
+# Theory: the tag compare (CFG30) cannot see a rebuild; the id compare can.
+# A base written by an older build carries no id line and must still work off
+# the tag alone (no warning when the tag matches).
+vt36_base() { # usage: vt36_base <dir> <from-image content>
+    mkdir -p "$1"
+    printf '%b' "$2" > "$1/from-image"
+    touch "$1/base.qcow2" "$1/vmlinuz"
+}
+fake_docker c36
+vt36_base /tmp/llmcfg-state-c36/bases/20260101-000000-1 'llm-in-a-box:vm\nimage-id sha256:oldimage\n'
+ln -sfn 20260101-000000-1 /tmp/llmcfg-state-c36/bases/latest
+check "CFG36 vm preflight warns when the base's image id differs under the same tag" \
+    "cd '/tmp/llmcfg-state-c36' && $(EV c36) FAKE_IMAGE_ID='sha256:newimage' LLMBOX_STATE_DIR='/tmp/llmcfg-state-c36' LLMBOX_VM_MISSING='qemu-system-x86_64 ssh' '$BOC' --runtime vm cfg36sess </dev/null >/tmp/llmcfg-c36.log 2>&1; \
+        grep -q 'built from vm image' /tmp/llmcfg-c36.log \
+        && grep -q \"sha256:oldimage\" /tmp/llmcfg-c36.log \
+        && grep -q \"sha256:newimage\" /tmp/llmcfg-c36.log"
+check "CFG36 the same image id under the same tag does not warn" \
+    "cd '/tmp/llmcfg-state-c36' && $(EV c36) FAKE_IMAGE_ID='sha256:oldimage' LLMBOX_STATE_DIR='/tmp/llmcfg-state-c36' LLMBOX_VM_MISSING='qemu-system-x86_64 ssh' '$BOC' --runtime vm cfg36sess </dev/null >/tmp/llmcfg-c36b.log 2>&1; \
+        ! grep -q 'built from vm image' /tmp/llmcfg-c36b.log"
+# An older base (no id line) falls back to the tag compare: same tag, no warning.
+fake_docker c36c
+vt36_base /tmp/llmcfg-state-c36c/bases/20260101-000000-1 'llm-in-a-box:vm\n'
+ln -sfn 20260101-000000-1 /tmp/llmcfg-state-c36c/bases/latest
+check "CFG36 a base without an id line falls back to the tag compare" \
+    "cd '/tmp/llmcfg-state-c36c' && $(EV c36c) FAKE_IMAGE_ID='sha256:whatever' LLMBOX_STATE_DIR='/tmp/llmcfg-state-c36c' LLMBOX_VM_MISSING='qemu-system-x86_64 ssh' '$BOC' --runtime vm cfg36sess </dev/null >/tmp/llmcfg-c36c.log 2>&1; \
+        ! grep -q 'built from vm image' /tmp/llmcfg-c36c.log"
+# And a base whose tag differs still warns when the content ids say it differs
+# (CFG30's message, unchanged, for a base that carries no id line).
+fake_docker c36d
+vt36_base /tmp/llmcfg-state-c36d/bases/20260101-000000-1 'oldorg/img:9\n'
+ln -sfn 20260101-000000-1 /tmp/llmcfg-state-c36d/bases/latest
+check "CFG36 a differing tag with no id line still warns (tag compare unchanged)" \
+    "cd '/tmp/llmcfg-state-c36d' && $(EV c36d) FAKE_IMAGE_ID='sha256:oldimage' LLMBOX_STATE_DIR='/tmp/llmcfg-state-c36d' LLMBOX_VM_MISSING='qemu-system-x86_64 ssh' '$BOC' --runtime vm cfg36sess </dev/null >/tmp/llmcfg-c36d.log 2>&1; \
+        grep -q 'different image' /tmp/llmcfg-c36d.log"
+# Identical content under a renamed ref is NOT a difference: the ids decide.
+fake_docker c36h
+vt36_base /tmp/llmcfg-state-c36h/bases/20260101-000000-1 'oldorg/img:9\nimage-id sha256:oldimage\n'
+ln -sfn 20260101-000000-1 /tmp/llmcfg-state-c36h/bases/latest
+write_cfg c36h 'image.vm=llm-in-a-box:vm\n'
+check "CFG36 a renamed ref with the same id does not warn" \
+    "cd '/tmp/llmcfg-state-c36h' && $(EV c36h) FAKE_IMAGE_ID='sha256:oldimage' LLMBOX_STATE_DIR='/tmp/llmcfg-state-c36h' LLMBOX_CONFIG='/tmp/llmcfg-cfg-c36h' LLMBOX_VM_MISSING='qemu-system-x86_64 ssh' '$BOC' --runtime vm cfg36sess </dev/null >/tmp/llmcfg-c36h.log 2>&1; \
+        ! grep -q 'built from' /tmp/llmcfg-c36h.log"
+check "CFG36 a renamed ref with a DIFFERENT id warns (the id wording)" \
+    "cd '/tmp/llmcfg-state-c36h' && $(EV c36h) FAKE_IMAGE_ID='sha256:newimage' LLMBOX_STATE_DIR='/tmp/llmcfg-state-c36h' LLMBOX_CONFIG='/tmp/llmcfg-cfg-c36h' LLMBOX_VM_MISSING='qemu-system-x86_64 ssh' '$BOC' --runtime vm cfg36sess </dev/null >/tmp/llmcfg-c36h2.log 2>&1; \
+        grep -q 'built from vm image' /tmp/llmcfg-c36h2.log"
+
+# The build records the id next to the ref, so a later rebuild is detectable.
+fake_docker c36e
+seed_refs c36e 'llm-in-a-box:vm\n'
+write_cfg c36e 'image.vm=llm-in-a-box:vm\n'
+check "CFG36 ./build vm records the image id in from-image" \
+    "cd '/tmp/llmcfg-state-c36e' && $(EV c36e) FAKE_IMAGE_ID='sha256:built36' LLMBOX_STATE_DIR='/tmp/llmcfg-state-c36e' LLMBOX_CONFIG='/tmp/llmcfg-cfg-c36e' bash '$BUILD' vm >/tmp/llmcfg-c36e.log 2>&1; \
+        grep -q '^image-id sha256:built36\$' /tmp/llmcfg-state-c36e/bases/\$(readlink /tmp/llmcfg-state-c36e/bases/latest)/from-image"
+
+# ── CFG36 (digest vs tag): the Docker 29 false positive ─────────────────────
+# Requirement (2026-10-24, found by the real-docker probe): the build records
+# the repo DIGEST when the image has one, and Docker 29 hands one out even for a
+# locally BUILT image — so the 2026-09-14 assumption "RepoDigests is empty for
+# local builds" no longer holds. Comparing that digest to the configured TAG
+# warned "built from a different image" about a base built from exactly that
+# image, on EVERY launch. The compare must resolve the configured image's own
+# digest; when docker cannot say, it stays silent and the id line decides.
+fake_docker c36f
+vt36_base /tmp/llmcfg-state-c36f/bases/20260101-000000-1 'probe/vm@sha256:aaa\n'
+ln -sfn 20260101-000000-1 /tmp/llmcfg-state-c36f/bases/latest
+write_cfg c36f 'image.vm=probe/vm:1\n'
+check "CFG36 a digest in from-image does not false-positive against the same image's tag" \
+    "cd '/tmp/llmcfg-state-c36f' && $(EV c36f) FAKE_DIGEST='[probe/vm@sha256:aaa]' LLMBOX_STATE_DIR='/tmp/llmcfg-state-c36f' LLMBOX_CONFIG='/tmp/llmcfg-cfg-c36f' LLMBOX_VM_MISSING='qemu-system-x86_64 ssh' '$BOC' --runtime vm cfg36f </dev/null >/tmp/llmcfg-c36f.log 2>&1; \
+        ! grep -q 'different image' /tmp/llmcfg-c36f.log"
+check "CFG36 a digest that no longer matches the tag's image still warns" \
+    "cd '/tmp/llmcfg-state-c36f' && $(EV c36f) FAKE_DIGEST='[probe/vm@sha256:bbb]' LLMBOX_STATE_DIR='/tmp/llmcfg-state-c36f' LLMBOX_CONFIG='/tmp/llmcfg-cfg-c36f' LLMBOX_VM_MISSING='qemu-system-x86_64 ssh' '$BOC' --runtime vm cfg36f </dev/null >/tmp/llmcfg-c36g.log 2>&1; \
+        grep -q 'different image' /tmp/llmcfg-c36g.log"
+check "CFG36 no repo digest to compare (docker cannot say) warns nothing" \
+    "cd '/tmp/llmcfg-state-c36f' && $(EV c36f) LLMBOX_STATE_DIR='/tmp/llmcfg-state-c36f' LLMBOX_CONFIG='/tmp/llmcfg-cfg-c36f' LLMBOX_VM_MISSING='qemu-system-x86_64 ssh' '$BOC' --runtime vm cfg36f </dev/null >/tmp/llmcfg-c36h.log 2>&1; \
+        ! grep -q 'different image' /tmp/llmcfg-c36h.log"
 
 echo ""
 echo "test_llm_in_a_box_config.sh: ${PASS} passed, ${FAIL} failed, ${SKIP} skipped"
