@@ -50,12 +50,14 @@ space the preinstalled toolchains take (a hosted runner starts with about
 13 GB free), prepares the host with `tests/setup-run-test-host.sh`,
 installs sysbox-ce 0.7.1 (the `fuse3` package too, and it waits until
 docker lists the `sysbox-runc` runtime), builds the launcher and hands
-everything to `tests/run-all-suites.sh`, which builds the relay, docker and
-sysbox images and runs every suite as the user and again as root. The
-images are built with the classic builder (`DOCKER_BUILDKIT=0`): a hosted
-runner has 4 cores and 16 GB, and BuildKit's final export of a 9 GB image
-stalled there until the runner was shut down. Hosted runners have no
-/dev/kvm, so the vm suite's checks skip; those skips are approved.
+everything to `tests/run-all-suites.sh`, which pulls the relay, docker and
+sysbox images from the image cache (see below) or builds them, and runs
+every suite as the user and again as root. The images are built with the
+classic builder (`DOCKER_BUILDKIT=0`): a hosted runner has 4 cores and
+16 GB, and BuildKit's final export of a 9 GB image stalled there until the
+runner was shut down. Hosted runners have no /dev/kvm, so the vm suite's
+checks skip; those skips are approved. On a push to main a third job runs
+first and fills the image cache.
 
 A single suite still runs on its own, for example
 `bash tests/test_llm_in_a_box_sessions.sh`.
@@ -153,9 +155,11 @@ runner runs them in passes (tests/test_run_all_suites.sh RS6, RS7):
 1. **before-images**: `test_llm_in_a_box_vm.sh`, only when no
    llm-in-a-box image exists yet, because one of its checks needs a host
    without images.
-2. Builds the images (`./build relay`, `./build docker`), unless
-   `--no-build`. If the build fails, the run stops there and `summary.md`
-   says so.
+2. Makes the images present (`scripts/ci/images relay docker`, plus
+   `sysbox` when docker lists the `sysbox-runc` runtime: `./build` for
+   each, or a pull from the image cache, see below), unless `--no-build`.
+   If that fails, the run stops there and `summary.md` says so
+   (tests/test_run_all_suites.sh RS8).
 3. **user**: every `tests/test_*.sh` suite as the invoking user, then
    `tests/verify-run-unattended.sh` (unattended runs on real docker; it
    refuses root, so it runs only here). Continuous integration first runs
@@ -220,6 +224,96 @@ stand-in tools on PATH (a stub find, stat, dd, mkdir or od) or pinned the
 bash launcher's own shell variables, which the Rust launcher never runs or
 assigns; and the vm checks that need /dev/kvm, absent on GitHub-hosted
 runners. Each line says why.
+
+## Image cache
+
+Every continuous integration run starts on a fresh hosted runner with an
+empty docker cache, where building the docker and sysbox images takes
+most of the 95 minutes the suites job used to take. So the runner reuses
+images built earlier from the same inputs.
+
+**What is cached.** The three images the suites need:
+`llm-in-a-box-relay:latest`, `llm-in-a-box:docker` and
+`llm-in-a-box:sysbox` (the vm image is not built in continuous
+integration). Each is stored under a fingerprint: the sha256 of a list of
+its inputs, which is the machine architecture, the build arguments, the
+`./build` script, the Dockerfile, the `.dockerignore`, each base image by
+digest (a tag such as `ubuntu:24.04` is looked up in its registry, so a
+moved tag is a new fingerprint) and every file the Dockerfile's `COPY`
+and `ADD` instructions copy in (path, executable bit, content; for a
+symbolic link named as a source, its target). Changing any of them gives
+a new fingerprint; changing anything else (the launcher, the tests, the
+docs) does not (tests/test_ci_images.sh IC1, IC2, IC3, IC12).
+`scripts/ci/images --inputs docker` prints the list and
+`--fingerprint docker` its hash. An instruction the list cannot account
+for (`COPY --from`, a URL, a variable, a `RUN` bind mount from the build
+context or from another image) means no fingerprint, and the image is
+built (IC4). Before any build with the cache configured, each base image
+looked up by tag is pulled at the recorded digest, so the build starts
+from the base the fingerprint names (IC5, IC7).
+
+**Where.** The GitHub container registry, as the package
+`ghcr.io/<owner>/<repository>-cache`, one tag per fingerprint
+(`ci.yml` names it from the repository it runs in). The script uses it
+only when `LBX_IMAGE_CACHE` names it, as the workflow does; local runs
+build as before (IC10). Each image is about 8.5 GB uncompressed and about
+3.2 GB as pushed; the registry's limits (10 GB per layer, a 10 minute
+timeout per upload) are far from the largest layer, 3.6 GB uncompressed.
+A `docker save` into the Actions cache would not fit: the docker and
+sysbox images compress to about 6.6 GB together, so the 10 GB cache
+budget of a repository could not hold the images of main and of a pull
+request that changes them at the same time.
+
+- **Pull requests** (the `suites` job, token with `packages: read`): the
+  runner looks the fingerprint up, pulls the image by its digest, checks
+  that the image's `lbx.ci-fingerprint` label is the fingerprint and that
+  its repository digests include the digest it asked for, and tags it
+  with the local name (IC6). On a miss, a registry error or a failed
+  check it builds, and it never pushes (IC7). A pull request that changes
+  an image input therefore builds that image, as before the cache.
+- **Main** (the `images` job, on every push to main, the only job that
+  pushes to the cache): on a miss it builds, adds the label and pushes
+  (IC5); on a hit it does nothing (IC8). The `suites` job on main waits
+  for it and then pulls. The pull request job's token only has
+  `packages: read`, so as the workflow stands, only reviewed, merged code
+  fills the cache. A branch of this repository could still edit the
+  workflow in its own pull request to ask for `packages: write`; closing
+  that needs the repository settings described below.
+
+`build.log` shows the input list and each image's line: `image docker:
+pulled sha256:...`, `built (<reason>)`, `built and pushed sha256:...` or
+`cached sha256:...`. The run's output shows the `image` lines under
+"building images" (tests/test_run_all_suites.sh RS8).
+
+**How to invalidate.** Change an input and the fingerprint changes by
+itself. To rebuild without changing anything, run the CI workflow by hand
+(workflow_dispatch) on main with `fresh_images` checked, or set
+`LBX_IMAGE_FRESH=1`: the images are built even on a hit, and on main the
+new build replaces the cached one (IC9). The Dockerfile installs some
+tools unpinned (the agents, yq, the Rust toolchain), so a cached image
+keeps the versions of the day it was built until an input changes, the
+`ubuntu:24.04` tag moves, or someone runs a fresh build on main. Deleting
+a package version in the registry's settings also works: the next run on
+main builds and pushes again.
+
+### Settings the cache needs
+
+Operational guidance, not verified by a test:
+
+- The first run of the `images` job creates the package
+  `<repository>-cache` under the repository's owner. In its settings,
+  "Manage Actions access" must give this repository at least Read (Write
+  for the push from main). Pull requests from forks run with a read-only
+  token, so the package must be public for them to pull; without read
+  access, runs build as before.
+- To make "only main pushes" hold even against a pull request that edits
+  the workflow: give this repository Read only, store a separate token
+  that can write packages as a secret of a GitHub environment that only
+  the main branch may use, and log in with that secret in the `images`
+  job.
+- Each new fingerprint stores another three images of about 3.2 GB each
+  as pushed; old versions of the package can be deleted at any time (a
+  later run just builds).
 
 ## Where results appear
 

@@ -825,7 +825,7 @@ if [ "$MIG6_READY" = true ]; then
         MIG14_BEFORE="$(docker exec -u 0 "$MIG_BOX" bash -c \
             "cd $MIG14_TREE && find . -type f -printf '%p %u %g\n' 2>/dev/null | sort" 2>/dev/null)"
         damage_box "$MIG_BOX"
-        migrate_real --migrate "$MIG_BOX" >/dev/null 2>&1 || true
+        MIG14_MIGRATE_OUT="$(migrate_real --migrate "$MIG_BOX" 2>&1)"; MIG14_MIGRATE_RC=$?
         MIG14_AFTER="$(docker exec -u 0 "$MIG_BOX" bash -c \
             "cd $MIG14_TREE && find . -type f -printf '%p %u %g\n' 2>/dev/null | sort" 2>/dev/null)"
         # Every file present before must be present after, owned by the box
@@ -835,7 +835,13 @@ if [ "$MIG6_READY" = true ]; then
         # and `comm` reports the lines missing from the after-list.
         MIG14_MISSING="$(comm -23 <(printf '%s\n' "$MIG14_BEFORE") \
                                   <(printf '%s\n' "$MIG14_AFTER"))"
-        [ -z "$MIG14_MISSING" ] || MIG14_OK=false
+        if [ -n "$MIG14_MISSING" ]; then
+            MIG14_OK=false
+            # Say what went missing and how the migration ended, so a failure on a slow host can be read from the log.
+            echo "    seed $seed: migration exit $MIG14_MIGRATE_RC; $(printf '%s\n' "$MIG14_BEFORE" | grep -c .) files before, $(printf '%s\n' "$MIG14_AFTER" | grep -c .) after"
+            printf '%s\n' "$MIG14_MISSING" | head -5 | sed 's/^/    missing: /'
+            printf '%s\n' "$MIG14_MIGRATE_OUT" | tail -5 | sed 's/^/    migrate: /'
+        fi
     done
     if [ "$MIG14_CASES" -eq 0 ]; then
         skip "MIG14 session trees of varying shape round-trip exactly (could not create a sysbox box)"
