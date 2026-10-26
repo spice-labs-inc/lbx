@@ -158,13 +158,8 @@ fn is_digest_ref(r: &str) -> bool {
 /// The first repo digest docker reports for an image (`repo@sha256:…`) — the
 /// form `build` writes into `from-image` when the image has one.
 fn image_repo_digest(image: &str) -> Option<String> {
-    let out = crate::docker::Docker::line(&[
-        "image",
-        "inspect",
-        "--format",
-        "{{.RepoDigests}}",
-        image,
-    ])?;
+    let out =
+        crate::docker::Docker::line(&["image", "inspect", "--format", "{{.RepoDigests}}", image])?;
     out.trim()
         .trim_start_matches('[')
         .trim_end_matches(']')
