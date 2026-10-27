@@ -137,6 +137,8 @@ export LLMBOX_STATE_DIR="$MIG_STATE"
 # remove exactly its own work and nothing else.
 MIG_BOX="mig-check-1"
 MIG_BOX2="mig-check-2"
+# The throwaway container that shows sysbox is back after a daemon restart.
+MIG_PROBE="mig-check-probe"
 
 # The ids the box user is created with. lbx passes HOST_UID="$(id -u)" and
 # HOST_GID="$(id -g)" to the container and the entrypoint creates the box user
@@ -162,7 +164,7 @@ fi
 cleanup() {
     # Remove any box this suite created, then the scratch tree. Failure is
     # tolerated: a check that already failed is the signal, not cleanup.
-    docker rm -f "$MIG_BOX" "$MIG_BOX2" >/dev/null 2>&1 || true
+    docker rm -f "$MIG_BOX" "$MIG_BOX2" "$MIG_PROBE" >/dev/null 2>&1 || true
     # The launcher gives every box a per-session docker volume, which
     # `docker rm` leaves behind; `--destroy` would remove it, but a box this
     # suite damaged may not be destroyable through the launcher.
@@ -267,17 +269,74 @@ box_read_as_user() {
     docker exec -u "$BOX_UID:$BOX_GID" "$1" cat "$2" 2>/dev/null
 }
 
+# The state of each sysbox unit, on one line.
+sysbox_units_state() {
+    local u line=""
+    for u in sysbox sysbox-mgr sysbox-fs; do
+        line="$line $u=$(systemctl is-active "$u" 2>/dev/null)"
+    done
+    printf '%s\n' "${line# }"
+}
+
+# Wait up to $1 seconds until the sysbox units are active and a new sysbox
+# container can start. A fixed sleep after the restart is not enough on a slow
+# host: a box started before sysbox is back fails to start and is never
+# damaged.
+wait_sysbox_ready() {
+    local deadline=$((SECONDS + $1))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        if [ "$(sysbox_units_state)" = "sysbox=active sysbox-mgr=active sysbox-fs=active" ] \
+            && docker run --rm --name "$MIG_PROBE" --runtime sysbox-runc --entrypoint true \
+                "$SYSBOX_IMAGE" >/dev/null 2>&1; then
+            return 0
+        fi
+        docker rm -f "$MIG_PROBE" >/dev/null 2>&1 || true
+        sleep 1
+    done
+    return 1
+}
+
+# Wait up to $2 seconds until the box is running, starting it again while it
+# is not.
+wait_box_running() {
+    local name="$1" deadline=$((SECONDS + $2))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        [ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" = true ] && return 0
+        docker start "$name" >/dev/null 2>&1 || true
+        sleep 1
+    done
+    return 1
+}
+
+# Wait up to $2 seconds until the box answers docker exec.
+wait_box_exec() {
+    local name="$1" deadline=$((SECONDS + $2))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        docker exec -u 0 "$name" true >/dev/null 2>&1 && return 0
+        sleep 1
+    done
+    return 1
+}
+
 # Damage a box exactly the way the field boxes are damaged: restart the
 # real sysbox daemons (which wipes sysbox-fs's in-memory state for
 # containers that already exist), then stop and start the box so its next
-# start comes up without its ID mapping.
+# start comes up without its ID mapping. Succeeds when sysbox came back and
+# the box is running again; how long each wait took is left in DAMAGE_WAITS.
 damage_box() {
-    local name="$1"
+    local name="$1" t0 rc=0 sysbox_secs box_secs
+    t0=$SECONDS
     as_root systemctl restart sysbox >/dev/null 2>&1
-    sleep 8
+    wait_sysbox_ready 120 || rc=1
+    sysbox_secs=$((SECONDS - t0))
     docker stop "$name" >/dev/null 2>&1
+    t0=$SECONDS
     docker start "$name" >/dev/null 2>&1
-    sleep 5
+    wait_box_running "$name" 60 || rc=1
+    box_secs=$((SECONDS - t0))
+    DAMAGE_WAITS="sysbox back after ${sysbox_secs}s, box running after ${box_secs}s"
+    [ "$rc" -eq 0 ] || DAMAGE_WAITS="$DAMAGE_WAITS (a wait timed out)"
+    return "$rc"
 }
 
 # A box is damaged when its ID mapping is gone, which shows up as the overflow
@@ -287,6 +346,35 @@ box_is_damaged() {
     local name="$1"
     [ "$(box_stat "$name" /etc/sudo.conf)" = "65534 65534 644" ] \
         && [ "$(host_stat "$name" /etc/sudo.conf)" = "0 0 644" ]
+}
+
+# What a box looked like, for the log when a check fails.
+box_report() {
+    local name="$1"
+    echo "    box state: $(docker inspect -f 'status={{.State.Status}} running={{.State.Running}} exit={{.State.ExitCode}} error={{.State.Error}}' "$name" 2>&1 | head -1)"
+    echo "    sysbox units: $(sysbox_units_state)"
+    echo "    /etc/sudo.conf: box sees '$(box_stat "$name" /etc/sudo.conf)', host sees '$(host_stat "$name" /etc/sudo.conf)'"
+}
+
+# Damage a box and confirm the damage shows, running the whole sequence up to
+# three times. What each failed try saw is left in DAMAGE_REPORT.
+damage_box_confirmed() {
+    local name="$1" try exec_note t0
+    DAMAGE_REPORT=""
+    for try in 1 2 3; do
+        damage_box "$name"
+        t0=$SECONDS
+        if wait_box_exec "$name" 60; then
+            exec_note="docker exec answered after $((SECONDS - t0))s"
+        else
+            exec_note="docker exec did not answer within 60s"
+        fi
+        box_is_damaged "$name" && return 0
+        DAMAGE_REPORT="$DAMAGE_REPORT    try $try: $DAMAGE_WAITS, $exec_note
+$(box_report "$name")
+"
+    done
+    return 1
 }
 
 echo "== migration: reporting (no container needed) =="
@@ -475,9 +563,8 @@ if [ "$MIG6_READY" = true ]; then
 
         # Damage it exactly as the field boxes are damaged, and confirm the
         # damage is the real thing before migrating.
-        damage_box "$MIG_BOX"
         MIG6_DAMAGED=false
-        box_is_damaged "$MIG_BOX" && MIG6_DAMAGED=true
+        damage_box_confirmed "$MIG_BOX" && MIG6_DAMAGED=true
 
         # Migrate.
         MIG6_OUT="$(migrate_real --migrate "$MIG_BOX" 2>&1)"
@@ -504,6 +591,7 @@ if [ "$MIG6_READY" = true ]; then
 
         check "MIG6 the box is damaged before the migration (ground truth: the box sees uid 65534 where the host sees uid 0)" \
             "[ \"\$MIG6_DAMAGED\" = true ]"
+        [ "$MIG6_DAMAGED" = true ] || printf '%s' "$DAMAGE_REPORT"
         check "MIG6 the box still exists after the migration" \
             "[ \"\$MIG6_EXISTS\" = true ]"
         # THE DISCRIMINATOR. A damaged box already satisfies "the box exists",
@@ -532,6 +620,13 @@ if [ "$MIG6_READY" = true ]; then
             "[ \"\$MIG6_SUDO\" = true ]"
         check "MIG6 after the migration the box user can read its session file, unchanged" \
             "[ \"\$MIG6_CONTENT\" = true ]"
+        case "$MIG6_EXISTS $MIG6_HEALED $MIG6_OWNED $MIG6_USERNS $MIG6_SUDO $MIG6_CONTENT" in
+            *false*)
+                echo "    migration exit $MIG6_RC"
+                printf '%s\n' "$MIG6_OUT" | tail -10 | sed 's/^/    migrate: /'
+                box_report "$MIG_BOX"
+                ;;
+        esac
 
         # The documented behaviour: only the home directory travels, so
         # anything installed in the container's own filesystem is gone. The
@@ -619,10 +714,12 @@ if [ "$MIG6_READY" = true ]; then
         box_write_as_user "$MIG_BOX" /home/agent/deep/sess.jsonl '{"type":"session","id":"deep"}'
         # Two daemon restarts plus a stop/start is the worst state.
         damage_box "$MIG_BOX"
+        wait_box_exec "$MIG_BOX" 60 || true
         damage_box "$MIG_BOX"
+        MIG7_WAITS="$DAMAGE_WAITS"
         MIG7_EXEC_BROKEN=false
-        docker exec -u 0 "$MIG_BOX" true >/dev/null 2>&1 || MIG7_EXEC_BROKEN=true
-        echo "  (MIG7 observation: docker exec broken after two restarts = $MIG7_EXEC_BROKEN)"
+        wait_box_exec "$MIG_BOX" 15 || MIG7_EXEC_BROKEN=true
+        echo "  (MIG7 observation: docker exec broken after two restarts = $MIG7_EXEC_BROKEN; $MIG7_WAITS)"
         # The host side must still be able to read the box's filesystem: this is
         # the path the export uses, and it is what makes the worst-state box
         # recoverable at all.
@@ -824,7 +921,8 @@ if [ "$MIG6_READY" = true ]; then
         MIG14_TREE=/home/agent/.pi/agent/sessions
         MIG14_BEFORE="$(docker exec -u 0 "$MIG_BOX" bash -c \
             "cd $MIG14_TREE && find . -type f -printf '%p %u %g\n' 2>/dev/null | sort" 2>/dev/null)"
-        damage_box "$MIG_BOX"
+        MIG14_DAMAGED=true
+        damage_box_confirmed "$MIG_BOX" || MIG14_DAMAGED=false
         MIG14_MIGRATE_OUT="$(migrate_real --migrate "$MIG_BOX" 2>&1)"; MIG14_MIGRATE_RC=$?
         MIG14_AFTER="$(docker exec -u 0 "$MIG_BOX" bash -c \
             "cd $MIG14_TREE && find . -type f -printf '%p %u %g\n' 2>/dev/null | sort" 2>/dev/null)"
@@ -841,6 +939,7 @@ if [ "$MIG6_READY" = true ]; then
             echo "    seed $seed: migration exit $MIG14_MIGRATE_RC; $(printf '%s\n' "$MIG14_BEFORE" | grep -c .) files before, $(printf '%s\n' "$MIG14_AFTER" | grep -c .) after"
             printf '%s\n' "$MIG14_MISSING" | head -5 | sed 's/^/    missing: /'
             printf '%s\n' "$MIG14_MIGRATE_OUT" | tail -5 | sed 's/^/    migrate: /'
+            [ "$MIG14_DAMAGED" = true ] || { echo "    seed $seed: the box did not show the damage before the migration"; printf '%s' "$DAMAGE_REPORT"; }
         fi
     done
     if [ "$MIG14_CASES" -eq 0 ]; then
