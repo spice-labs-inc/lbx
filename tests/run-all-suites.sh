@@ -20,8 +20,10 @@
 #   before-images  test_llm_in_a_box_vm.sh, as the invoking user, only when no
 #                  llm-in-a-box image exists yet: its "unbuilt vm image" check
 #                  needs a host without images.
-#   (build)        ./build relay and ./build docker, plus ./build sysbox when
-#                  docker has the sysbox-runc runtime, unless --no-build.
+#   (build)        scripts/ci/images relay docker, plus sysbox when docker has
+#                  the sysbox-runc runtime, unless --no-build: ./build for
+#                  each, or with LBX_IMAGE_CACHE set, the continuous
+#                  integration image cache (see that script).
 #   user           every test_*.sh suite except this script's own test, then
 #                  verify-run-unattended.sh (real docker, user only).
 #   root           the suites with root-only checks (config, migrate, docker
@@ -155,7 +157,9 @@ fi
 
 if [ "$BUILD" = 1 ]; then
     printf '==== building images ====\n'
-    ( cd "$REPO" && ./build relay && ./build docker && { ! $DOCKER_CMD info --format "{{json .Runtimes}}" 2>/dev/null | grep >/dev/null sysbox-runc || ./build sysbox; } ) > "$LOGS/build.log" 2>&1 \
+    images=(relay docker)
+    $DOCKER_CMD info --format "{{json .Runtimes}}" 2>/dev/null | grep -q sysbox-runc && images+=(sysbox)
+    ( cd "$REPO" && scripts/ci/images "${images[@]}" ) > "$LOGS/build.log" 2>&1 \
         || { tail -40 "$LOGS/build.log"; echo "Image build failed; no suites ran after it. See build.log." > "$LOGS/summary.md"; cat "$LOGS/summary.md"; exit 1; }
     grep "^image " "$LOGS/build.log"
 fi

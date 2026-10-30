@@ -1,0 +1,426 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# scripts/ci/images [--push] [--fresh] <relay|docker|sysbox>...
+# scripts/ci/images --fingerprint <relay|docker|sysbox>
+# scripts/ci/images --inputs <relay|docker|sysbox>
+#
+# Make the images the test suites need present (llm-in-a-box-relay:latest
+# and the configured docker and sysbox images), reusing an earlier build
+# from the continuous integration image cache when the image's inputs have
+# not changed. Every continuous integration run starts on a fresh machine
+# with an empty docker cache, where ./build docker and ./build sysbox take
+# most of the suites job's 95 minutes and a pull takes minutes.
+#
+# Fingerprint: the sha256 of a text that lists every input of the image:
+# a format version, the image name, the machine architecture, the build
+# arguments ./build passes, the ./build script, the Dockerfile, any
+# .dockerignore, each base image (FROM) by digest (a tag is resolved in the
+# registry, so an update of the base image is a new fingerprint), and
+# every file the Dockerfile's COPY and ADD instructions copy in (path,
+# executable bit, content hash; a directory contributes all files under
+# it, a symbolic link named as a source its target). --inputs prints that
+# text, --fingerprint its hash. Anything the parser cannot account for
+# (COPY --from, a URL, a variable, a heredoc, a JSON-form source list, a
+# missing source, a RUN bind mount from the context or another image, an
+# escape directive) makes the fingerprint unavailable, and the image is
+# built.
+#
+# The cache is <LBX_IMAGE_CACHE>:<fingerprint>. With LBX_IMAGE_CACHE unset
+# or empty the images are built with ./build, as before this script
+# existed. Per image:
+#   default (pull requests, local runs): read the tag's digest from the
+#     registry; on a hit pull <repo>@<digest>, require its fingerprint
+#     label to equal the fingerprint and its repository digests to include
+#     <repo>@<digest>, and tag it with the local name. On a miss, a
+#     registry error or a failed check, build with ./build. Never pushes.
+#   --push (LBX_IMAGE_CACHE_PUSH=1; only the main-branch job): a hit is
+#     reported and left alone (not pulled). On a miss, build with ./build,
+#     add the fingerprint label, push, and read the digest back. Every
+#     build (pull or push run) first pulls each base image looked up by
+#     tag at the recorded digest and tags it locally. A fingerprint that
+#     cannot be computed fails the run instead of building an image
+#     nothing can reuse.
+#   --fresh (LBX_IMAGE_FRESH=1 or true): skip the lookup and build; with
+#     --push the new build replaces the cached one.
+#
+# The launcher that names the images is LBX_BIN, else the release build
+# next to ./build, else the debug build, else lbx on PATH (as ./build
+# resolves it). Registry reads use docker buildx imagetools. A push is
+# retried LBX_IMAGE_PUSH_ATTEMPTS times (default 3), waiting
+# LBX_IMAGE_RETRY_DELAY seconds (default 15) times the attempt number.
+#
+# Prints one line per image, starting "image <name>: ": "pulled <digest>",
+# "built (<reason>)", "built and pushed <digest>" or "cached <digest>".
+# Exits 1 when a build, push or (with --push) fingerprint fails, 2 on a
+# usage error.
+# ---------------------------------------------------------------------------
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$HERE/../.." && pwd)"
+
+FORMAT="lbx ci image fingerprint 1"
+LABEL=lbx.ci-fingerprint
+CACHE="${LBX_IMAGE_CACHE:-}"
+PUSH=0
+FRESH=0
+case "${LBX_IMAGE_CACHE_PUSH:-}" in 1|true) PUSH=1 ;; esac
+case "${LBX_IMAGE_FRESH:-}" in 1|true) FRESH=1 ;; esac
+
+usage() {
+    echo "usage: images [--push] [--fresh] <relay|docker|sysbox>... | --fingerprint <image> | --inputs <image>" >&2
+    exit 2
+}
+
+# lbx_bin: print the launcher ./build would use, or fail.
+lbx_bin() {
+    if [ -n "${LBX_BIN:-}" ]; then printf '%s\n' "$LBX_BIN"
+    elif [ -x "$ROOT/target/release/lbx" ]; then printf '%s\n' "$ROOT/target/release/lbx"
+    elif [ -x "$ROOT/target/debug/lbx" ]; then printf '%s\n' "$ROOT/target/debug/lbx"
+    elif command -v lbx >/dev/null 2>&1; then command -v lbx
+    else echo "images: no lbx binary found: set LBX_BIN or build one (cargo build)" >&2; return 1
+    fi
+}
+
+# configured_image <sysbox|docker>: the image name the launcher is
+# configured with for that runtime (what ./build tags).
+configured_image() {
+    local bin name
+    bin="$(lbx_bin)" || return 1
+    name="$(LBX_SCRIPT_DIR="$ROOT" "$bin" --print-images | tr ' ' '\n' | sed -n "s/^$1=//p")"
+    [ -n "$name" ] || { echo "images: cannot resolve the $1 image name (lbx --print-images)" >&2; return 1; }
+    printf '%s\n' "$name"
+}
+
+# image_vars <name>: set CTX, DOCKERFILE (relative to the repository root),
+# BUILD_ARGS (what ./build passes) and LOCAL (the name ./build tags).
+image_vars() {
+    case "$1" in
+        relay)
+            CTX=docker/relay
+            DOCKERFILE=docker/relay/Dockerfile
+            BUILD_ARGS=""
+            LOCAL=llm-in-a-box-relay:latest
+            ;;
+        docker|sysbox)
+            CTX=.
+            DOCKERFILE=Dockerfile
+            BUILD_ARGS="RUNTIME_TYPE=$1"
+            LOCAL="$(configured_image "$1")" || return 1
+            ;;
+        *) return 2 ;;
+    esac
+}
+
+# registry_digest <ref>: print the digest the registry holds for
+# <repo>:<tag> or <repo>@<digest>, with no trailing newline. Reads the
+# registry, never the local image store. Returns 0 when found; 1 only when
+# the registry answered that the image does not exist (buildx's "<ref>:
+# not found" line, or "manifest unknown"); 2 for any other failure
+# (authentication, network, a malformed answer), with the registry's
+# message on standard error. Callers must not treat 2 as "absent".
+registry_digest() {
+    local errf out rc
+    errf="$(mktemp "${TMPDIR:-/tmp}/lbx-images-inspect.XXXXXX")" || return 2
+    out="$(docker buildx imagetools inspect --format '{{printf "%s" .Manifest.Digest}}' "$1" 2>"$errf")"
+    rc=$?
+    if [ "$rc" = 0 ] && [[ "$out" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+        rm -f "$errf"
+        printf '%s' "$out"
+        return 0
+    fi
+    if [ "$rc" != 0 ] && { grep -qE ': not found$' "$errf" || grep -qiE 'manifest[ _]unknown' "$errf"; }; then
+        rm -f "$errf"
+        return 1
+    fi
+    [ "$rc" = 0 ] && echo "unexpected digest from the registry for $1: '$out'" >&2
+    cat "$errf" >&2
+    rm -f "$errf"
+    return 2
+}
+
+# retry <attempts> <command...>: run the command until it succeeds, at
+# most <attempts> times. Registry uploads time out now and then; a retry
+# resumes from the layers already stored.
+retry() {
+    local attempts="$1" n
+    shift
+    for ((n = 1; n <= attempts; n++)); do
+        "$@" && return 0
+        echo "images: attempt $n of $attempts failed: $*" >&2
+        [ "$n" -lt "$attempts" ] && sleep $(( ${LBX_IMAGE_RETRY_DELAY:-15} * n ))
+    done
+    return 1
+}
+
+# file_line <dir> <path>: "file <path> <x|-> <sha256>" for a file, or
+# "link <path> <target>" for a symbolic link inside a copied directory
+# (docker copies those as links). Only the executable bit is recorded: the
+# other mode bits follow the checkout's umask, not the repository.
+file_line() {
+    local p="$1/$2" h
+    if [ -L "$p" ]; then
+        printf 'link %s %s\n' "$2" "$(readlink "$p")"
+        return 0
+    fi
+    h="$(sha256sum < "$p")" || { echo "images: cannot read $2" >&2; return 1; }
+    printf 'file %s %s %s\n' "$2" "$([ -x "$p" ] && echo x || echo -)" "${h%% *}"
+}
+
+# instructions <dockerfile>: one logical instruction per line, with line
+# continuations joined and comment and blank lines (also inside a
+# continuation, as docker allows) dropped.
+instructions() {
+    awk '
+        /^[[:space:]]*#/ { next }
+        /^[[:space:]]*$/ { next }
+        {
+            line = $0
+            if (line ~ /\\[[:space:]]*$/) { sub(/\\[[:space:]]*$/, "", line); buf = buf line " "; next }
+            print buf line; buf = ""
+        }
+        END { if (buf != "") print buf }' "$1"
+}
+
+# sources <context> <source>: the context-relative paths of the files one
+# COPY or ADD source names (every file under a directory; glob matches).
+sources() {
+    local ctx="$1" src="$2" m
+    src="${src#/}"
+    while [ "${src#./}" != "$src" ]; do src="${src#./}"; done
+    case "/$src/" in */../*) echo "images: source '$2' leaves the build context" >&2; return 1 ;; esac
+    [ -n "$src" ] || src=.
+    local matches=()
+    if [[ "$src" == *[*?[]* ]]; then
+        # shellcheck disable=SC2086 # $src is a glob, expanded on purpose
+        while IFS= read -r m; do matches+=("$m"); done < <(cd "$ctx" && shopt -s nullglob dotglob && for m in $src; do printf '%s\n' "$m"; done)
+        [ ${#matches[@]} -gt 0 ] || { echo "images: source '$2' matches nothing" >&2; return 1; }
+    else
+        [ -e "$ctx/$src" ] || [ -L "$ctx/$src" ] || { echo "images: source '$2' does not exist" >&2; return 1; }
+        matches=("$src")
+    fi
+    local real top
+    top="$(cd "$ctx" && pwd -P)"
+    for m in "${matches[@]}"; do
+        # docker follows a symbolic link named as a source (or matched by
+        # a glob) and copies its target, so the target is the input.
+        if [ -L "$ctx/$m" ]; then
+            real="$(realpath -e "$ctx/$m" 2>/dev/null)" || { echo "images: source '$m' is a broken link" >&2; return 1; }
+            case "$real" in "$top") m=. ;; "$top"/*) m="${real#"$top"/}" ;; *) echo "images: source '$m' links outside the build context" >&2; return 1 ;; esac
+        fi
+        if [ -d "$ctx/$m" ]; then
+            (cd "$ctx" && find "$m" \( -type f -o -type l \) -print) | sed 's|^\./||' || return 1
+        else
+            printf '%s\n' "$m"
+        fi
+    done
+}
+
+# fingerprint_text <name>: print the text the fingerprint hashes, or fail
+# with the reason on standard error.
+fingerprint_text() {
+    image_vars "$1" || return 1
+    local ctx="$ROOT/$CTX" df="$ROOT/$DOCKERFILE" words word ref digest i n stages=" " files sorted
+    [ -f "$df" ] || { echo "images: $DOCKERFILE does not exist" >&2; return 1; }
+    if grep -qiE '^#[[:space:]]*escape[[:space:]]*=' "$df"; then
+        echo "images: $DOCKERFILE sets an escape directive, which the fingerprint does not parse" >&2
+        return 1
+    fi
+    # The architecture: a cached image only fits hosts that build the same.
+    # A .dockerignore decides which files a directory COPY takes, and
+    # whether a named source may be copied at all.
+    printf '%s\nimage %s\narch %s\nbuild-args %s\n' "$FORMAT" "$1" "$(uname -m)" "$BUILD_ARGS"
+    file_line "$ROOT" build || return 1
+    file_line "$ROOT" "$DOCKERFILE" || return 1
+    if [ -f "$ctx/.dockerignore" ]; then file_line "$ctx" .dockerignore || return 1; fi
+    if [ -f "$df.dockerignore" ]; then file_line "$ROOT" "$DOCKERFILE.dockerignore" || return 1; fi
+    files="$(mktemp "${TMPDIR:-/tmp}/lbx-images.XXXXXX")" || return 1
+    while read -r -a words; do
+        [ ${#words[@]} -gt 0 ] || continue
+        case "${words[0]^^}" in
+            FROM)
+                i=1
+                while [ "$i" -lt "${#words[@]}" ] && [[ "${words[$i]}" == --* ]]; do i=$((i + 1)); done
+                ref="${words[$i]:-}"
+                [ "${#words[@]}" -gt $((i + 2)) ] && [ "${words[$((i + 1))]^^}" = AS ] && stages+="${words[$((i + 2))]} "
+                if [ -z "$ref" ] || [[ "$ref" == *'$'* ]]; then
+                    echo "images: cannot read the base image of '${words[*]}'" >&2; rm -f "$files"; return 1
+                elif [[ "$stages" == *" $ref "* ]] || [ "$ref" = scratch ] || [[ "$ref" == *@sha256:* ]]; then
+                    printf 'base %s\n' "$ref"
+                elif digest="$(registry_digest "$ref")"; then
+                    printf 'base %s %s\n' "$ref" "$digest"
+                else
+                    echo "images: cannot resolve the digest of the base image $ref" >&2; rm -f "$files"; return 1
+                fi
+                ;;
+            RUN)
+                # A bind mount (the default mount type) reads files the
+                # fingerprint does not see: from the build context, or from
+                # an image named in from=. Only a bind from an earlier stage
+                # of this Dockerfile is accounted for. BuildKit reads mount
+                # keys and the type case-insensitively.
+                for word in "${words[@]:1}"; do
+                    word="${word,,}"
+                    [[ "$word" == --mount=* ]] || continue
+                    word=",${word#--mount=},"
+                    [[ "$word" == *,type=bind,* ]] || [[ "$word" != *,type=* ]] || continue
+                    ref=""
+                    [[ "$word" =~ ,from=([^,]*), ]] && ref="${BASH_REMATCH[1]}"
+                    if [ -z "$ref" ] || [[ "${stages,,}" != *" $ref "* ]]; then
+                        echo "images: a RUN bind mount the fingerprint cannot account for: '${words[*]}'" >&2; rm -f "$files"; return 1
+                    fi
+                done
+                ;;
+            COPY|ADD)
+                i=1
+                while [ "$i" -lt "${#words[@]}" ] && [[ "${words[$i]}" == --* ]]; do
+                    case "${words[$i]}" in
+                        --chown=*|--chmod=*|--link|--link=*) ;;
+                        *) echo "images: unsupported flag in '${words[*]}'" >&2; rm -f "$files"; return 1 ;;
+                    esac
+                    i=$((i + 1))
+                done
+                n=$(( ${#words[@]} - 1 ))
+                if [ $((n - i)) -lt 1 ] || [[ "${words[$i]}" == \[* ]] || [[ "${words[*]}" == *'<<'* ]]; then
+                    echo "images: cannot read the sources of '${words[*]}'" >&2; rm -f "$files"; return 1
+                fi
+                for ((; i < n; i++)); do
+                    word="${words[$i]}"
+                    if [[ "$word" == *'$'* ]] || [[ "$word" =~ ^[A-Za-z][A-Za-z0-9+.-]*:// ]] || [[ "$word" == git@* ]]; then
+                        echo "images: unsupported source '$word' in '${words[*]}'" >&2; rm -f "$files"; return 1
+                    fi
+                    sources "$ctx" "$word" >> "$files" || { rm -f "$files"; return 1; }
+                done
+                ;;
+        esac
+    done < <(instructions "$df")
+    sorted="$(LC_ALL=C sort -u "$files")" || { rm -f "$files"; return 1; }
+    rm -f "$files"
+    [ -n "$sorted" ] || return 0
+    while IFS= read -r word; do
+        file_line "$ctx" "$word" || return 1
+    done <<< "$sorted"
+}
+
+hash_text() { printf "%s\n" "$1" | sha256sum | cut -d" " -f1; }
+
+fingerprint() {
+    local text
+    text="$(fingerprint_text "$1")" || return 1
+    hash_text "$text"
+}
+
+# build <name>: build with ./build, the same build developers run.
+build() { (cd "$ROOT" && ./build "$1"); }
+
+# pin_bases <fingerprint text>: pull each base image the fingerprint looked
+# up by tag at the digest it recorded and give it that tag locally, so the
+# build (which uses a local image of that tag) starts from the base the
+# fingerprint names even if the tag has moved since.
+pin_bases() {
+    local kind ref digest repo
+    while read -r kind ref digest; do
+        [ "$kind" = base ] && [ -n "$digest" ] || continue
+        repo="$ref"
+        [[ "${ref##*/}" == *:* ]] && repo="${ref%:*}"
+        if ! { docker pull "$repo@$digest" && docker tag "$repo@$digest" "$ref"; }; then
+            echo "images: cannot pull the base image $repo@$digest" >&2
+            return 1
+        fi
+    done <<< "$1"
+}
+
+# ensure <name>: make one image present (and, with --push, cached).
+ensure() {
+    local name="$1" text fp ref digest reason got repo_digests
+    image_vars "$name" || return 1
+    if [ -z "$CACHE" ]; then
+        build "$name" || return 1
+        echo "image $name: built (no cache configured)"
+        return 0
+    fi
+    echo "== $name: fingerprint inputs"
+    if ! text="$(fingerprint_text "$name")"; then
+        if [ "$PUSH" = 1 ]; then
+            echo "image $name: fingerprint unavailable (see above); nothing built or pushed"
+            return 1
+        fi
+        build "$name" || return 1
+        echo "image $name: built (fingerprint unavailable, see above)"
+        return 0
+    fi
+    fp="$(hash_text "$text")"
+    printf "%s\n" "$text" | sed "s/^/   /"
+    ref="$CACHE:$fp"
+    if [ "$FRESH" = 1 ]; then
+        reason="fresh build requested"
+    else
+        digest="$(registry_digest "$ref")"
+        case $? in
+            0)
+                if [ "$PUSH" = 1 ]; then
+                    echo "image $name: cached $digest ($ref); not rebuilt"
+                    return 0
+                fi
+                if docker pull "$CACHE@$digest"; then
+                    got="$(docker image inspect --format "{{index .Config.Labels \"$LABEL\"}}" "$CACHE@$digest")"
+                    repo_digests="$(docker image inspect --format '{{join .RepoDigests " "}}' "$CACHE@$digest")"
+                    if [ "$got" != "$fp" ]; then
+                        reason="the pulled image's fingerprint label is '$got', not $fp"
+                    elif [[ " $repo_digests " != *" $CACHE@$digest "* ]]; then
+                        reason="the pulled image's digests ($repo_digests) do not include $digest"
+                    elif docker tag "$CACHE@$digest" "$LOCAL"; then
+                        echo "image $name: pulled $digest ($ref)"
+                        return 0
+                    else
+                        reason="tagging the pulled image failed"
+                    fi
+                else
+                    reason="pull of $CACHE@$digest failed"
+                fi
+                ;;
+            1) reason="cache miss for $ref" ;;
+            *) reason="cache unreadable (registry error above)" ;;
+        esac
+    fi
+    echo "== $name: $reason; building"
+    pin_bases "$text" || return 1
+    build "$name" || return 1
+    if [ "$PUSH" != 1 ]; then
+        echo "image $name: built ($reason; not pushed)"
+        return 0
+    fi
+    # The label is the image's own claim of its fingerprint; pullers check
+    # it against the tag they asked for. A LABEL-only build adds no layer.
+    docker build --label "$LABEL=$fp" -t "$ref" - <<< "FROM $LOCAL" || return 1
+    docker tag "$ref" "$LOCAL" || return 1
+    retry "${LBX_IMAGE_PUSH_ATTEMPTS:-3}" docker push "$ref" || return 1
+    digest="$(registry_digest "$ref")" || return 1
+    echo "image $name: built and pushed $digest ($ref)"
+}
+
+mode=ensure
+images=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --push) PUSH=1; shift ;;
+        --fresh) FRESH=1; shift ;;
+        --fingerprint) mode=fingerprint; shift ;;
+        --inputs) mode=inputs; shift ;;
+        relay|docker|sysbox) images+=("$1"); shift ;;
+        *) usage ;;
+    esac
+done
+[ ${#images[@]} -gt 0 ] || usage
+
+case "$mode" in
+    fingerprint) [ ${#images[@]} = 1 ] || usage; fingerprint "${images[0]}"; exit ;;
+    inputs) [ ${#images[@]} = 1 ] || usage; fingerprint_text "${images[0]}"; exit ;;
+esac
+
+if [ "$PUSH" = 1 ] && [ -z "$CACHE" ]; then
+    echo "images: --push needs LBX_IMAGE_CACHE (the cache repository)" >&2
+    exit 2
+fi
+for img in "${images[@]}"; do
+    ensure "$img" || { echo "image $img: failed"; exit 1; }
+done

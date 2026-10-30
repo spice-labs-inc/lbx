@@ -8,8 +8,8 @@
 # the code the test wrote for it (per suite and pass), and records each call
 # (pass name, and whether it ran through the root command). Root is
 # simulated with --sudo "env FAKE_ROOT=1", the temporary directory with
-# --tmp, and image builds are off (--no-build; RS8 puts
-# a stub ./build in its place), so no root, docker or
+# --tmp, and image builds are off (--no-build; RS8 puts a stub
+# scripts/ci/images in their place), so no root, docker or
 # network is needed, except RS4 which parses the JUnit file with a real XML
 # parser in a container.
 #
@@ -213,20 +213,22 @@ check "RS7 with images present the vm suite runs only in the user pass" \
 
 # ── RS8: the image step ─────────────────────────────────────────────────────
 # Requirement: without --no-build the runner makes the images with
-# ./build relay and ./build docker, run from the repository root (the parent
-# of the suites directory), shows the build's "image ..." lines in its own
-# output, and stops before any suite when a build fails. A stub build
-# records its arguments and working directory and prints an image line
-# among other output.
+# scripts/ci/images relay docker (sysbox too only when docker lists the
+# sysbox-runc runtime), run from the repository root (the parent of the
+# suites directory), shows that script's "image ..." lines (built, or
+# pulled with the digest) in its own output, and stops before any suite
+# when the script fails. A stub script records its arguments and working
+# directory and prints an image line among other output.
 rs8_stub() { # <exit code>
+    mkdir -p "$CASE/scripts/ci"
     # shellcheck disable=SC2016 # the stub expands these when it runs
     printf '%s\n' '#!/usr/bin/env bash' \
         'echo "$PWD $*" >> "$FAKE/images.calls"' \
         'echo "==> noise that stays in build.log"' \
         'echo "image relay: pulled sha256:0123 (cache:abc)"' \
         'echo "image docker: built (cache miss for cache:def; not pushed)"' \
-        "exit $1" > "$CASE/build"
-    chmod +x "$CASE/build"
+        "exit $1" > "$CASE/scripts/ci/images"
+    chmod +x "$CASE/scripts/ci/images"
 }
 run_runner_build() {
     bash "$RUNNER" --suites-dir "$CASE/suites" --tmp "$CASE/tmp" \
@@ -237,9 +239,8 @@ new_case "$OTHER"
 echo "[PASS] other" > "$FAKE/$OTHER.user.out"
 rs8_stub 0
 run_runner_build; rc=$?
-check "RS8 the image step runs ./build relay and ./build docker from the repository root and shows their image lines" \
-    "[ $rc = 0 ] && [ \"\$(cat '$FAKE/images.calls')\" = \"$CASE relay
-$CASE docker\" ] \
+check "RS8 the image step runs scripts/ci/images relay docker from the repository root and shows its image lines" \
+    "[ $rc = 0 ] && [ \"\$(cat '$FAKE/images.calls')\" = '$CASE relay docker' ] \
         && grep -qx 'image relay: pulled sha256:0123 (cache:abc)' '$CASE/runner.out' \
         && grep -qx 'image docker: built (cache miss for cache:def; not pushed)' '$CASE/runner.out' \
         && ! grep -q 'noise' '$CASE/runner.out' && grep -q 'noise' '$CASE/logs/build.log' \

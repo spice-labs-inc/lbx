@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      fresh_images:
+        description: Build the box images even when the image cache has them (on main, the new build replaces the cached one)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -16,7 +22,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -35,6 +41,79 @@ jobs:
       - name: Test the suite runner
         run: bash tests/test_run_all_suites.sh
 
+      - name: Test the image cache script
+        run: bash tests/test_ci_images.sh
+
+  # On every push to main: make sure the image cache
+  # (ghcr.io/<owner>/<repository>-cache:<fingerprint>) holds the relay,
+  # docker and sysbox images for main's inputs, so suite runs whose image
+  # inputs match main pull them in minutes instead of building them for
+  # most of an hour and a half. Every decision is in scripts/ci/images
+  # (tested by tests/test_ci_images.sh); see docs/testing.md, "Image cache".
+  #
+  # Only this job pushes to the cache, and only from main: what it builds
+  # is reviewed, merged code. Pull requests (Dependabot's included, whose
+  # token is read-only anyway) get a token that only reads packages and
+  # only pull; if they could push, a pull request could put an image under
+  # a fingerprint that later runs trust. A workflow_dispatch run on main
+  # with fresh_images rebuilds the images and replaces the cached ones (for
+  # example to pick up newer unpinned tools).
+  images:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: image-cache
+      cancel-in-progress: false
+    env:
+      LBX_IMAGE_CACHE_PUSH: "1"
+      LBX_IMAGE_FRESH: ${{ inputs.fresh_images }}
+      DOCKER_BUILDKIT: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift \
+            /usr/local/share/powershell /usr/local/share/chromium \
+            /usr/local/lib/node_modules
+          sudo docker image prune -af >/dev/null
+          sudo apt-get clean
+          df -h /
+
+      # ./build and scripts/ci/images ask the launcher for the image names.
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Build the launcher
+        run: cargo build --locked
+
+      # Registry names are lowercase; the repository name need not be.
+      - name: Name the image cache
+        run: echo "LBX_IMAGE_CACHE=ghcr.io/${GITHUB_REPOSITORY,,}-cache" >> "$GITHUB_ENV"
+
+      # Registry digest reads need the buildx plugin, which hosted runners carry.
+      - name: Check docker buildx
+        run: docker buildx version
+
+      - name: Log in to ghcr.io
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Build and push the images main's inputs need
+        run: |
+          ( while sleep 120; do echo "disk: $(df -h / | tail -1)  mem: $(free -m | awk '/Mem:/{print $7" MB free"}')"; done ) &
+          scripts/ci/images relay docker sysbox
+
   # The suites in tests/ build the box images (several gigabytes each, with
   # a Rust toolchain compiled inside) and need a real docker daemon, sysbox
   # and root. A hosted runner has 4 cores and 16 GB; BuildKit's final
@@ -43,14 +122,28 @@ jobs:
   # (DOCKER_BUILDKIT=0), which commits each layer as its instruction
   # finishes. The vm suite needs /dev/kvm, which hosted runners do not have;
   # its checks are approved skips.
+  #
+  # The images come from the image cache when their inputs match an image
+  # main pushed (scripts/ci/images; on main this job therefore waits for
+  # the images job, and runs whatever that job's result was: on a failure
+  # it builds locally). The cache is read-only here: pull requests run
+  # code nobody has reviewed yet, so this job's token only reads packages;
+  # on a miss it builds locally and pushes nothing. A failed login (a
+  # token that cannot read the package) only means building locally.
   suites:
+    needs: images
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 180
+    permissions:
+      contents: read
+      packages: read
     env:
       LBX_BIN: ${{ github.workspace }}/target/debug/lbx
+      LBX_IMAGE_FRESH: ${{ inputs.fresh_images }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -110,10 +203,18 @@ jobs:
       - name: Build the launcher
         run: cargo build --locked
 
-      # The runner builds the images itself (relay, docker, and sysbox when
-      # the runtime is there), then runs every suite as the user and the
-      # root-only ones again as root.
-      - name: Build the images and run the suites
+      - name: Name the image cache
+        run: echo "LBX_IMAGE_CACHE=ghcr.io/${GITHUB_REPOSITORY,,}-cache" >> "$GITHUB_ENV"
+
+      - name: Log in to ghcr.io to read the image cache
+        env:
+          TOKEN: ${{ github.token }}
+        run: printf '%s' "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin || echo "No image cache login; the images will be built."
+
+      # The runner pulls or builds the images (relay, docker, and sysbox
+      # when the runtime is there), then runs every suite as the user and
+      # the root-only ones again as root.
+      - name: Pull or build the images and run the suites
         env:
           DOCKER_BUILDKIT: "0"
         run: |
@@ -131,7 +232,7 @@ jobs:
 
       - name: Keep the logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-logs
           path: test-logs/
