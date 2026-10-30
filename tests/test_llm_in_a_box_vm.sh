@@ -154,7 +154,7 @@ FIXEMPTY=/tmp/llm-in-a-box-vmsempty
 # the behavior an explicit --runtime vm shows on a broken host.
 make_vm_fixture "$FIX1"
 check "auto-detect selects vm when the vm image is built, then fails with guidance when prereqs are missing" \
-    "cd '$FIX1/project' && LLMBOX_STATE_DIR='$FIX1/state' LLMBOX_VM_MISSING='/dev/kvm kvm-group qemu-system-x86_64' '$BOC' llm-in-a-box-vmtest >/tmp/llm-in-a-box-vmp1.log 2>&1; [ \$? -ne 0 ] \
+    "cd '$FIX1/project' && LLMBOX_STATE_DIR='$FIX1/state' LLMBOX_VM_MISSING='/dev/kvm kvm-group qemu-system-x86_64' '$BOC' llm-in-a-box-vmtest </dev/null >/tmp/llm-in-a-box-vmp1.log 2>&1; [ \$? -ne 0 ] \
         && grep -q 'Auto-detected runtime: vm' /tmp/llm-in-a-box-vmp1.log \
         && grep -q '/dev/kvm' /tmp/llm-in-a-box-vmp1.log \
         && grep -q 'usermod -aG kvm' /tmp/llm-in-a-box-vmp1.log \
@@ -171,11 +171,17 @@ check "auto-detected vm failure tells the user how to force a different runtime"
 # error is asserted only when no llm-in-a-box:* image exists locally
 # (skip-not-fail: once images are built on this VM, detection falls back
 # to docker/sysbox, which is also a correct not-vm outcome).
+# `</dev/null` is REQUIRED here (2026-10-25 incident): with images built,
+# auto-detect falls back to a container runtime and the launcher then ATTACHES
+# (`docker exec -it … bash`). From a terminal that exec waits for input
+# forever while the check's output goes to its log — the suite hung with no
+# output at all. With stdin not a TTY the exec fails immediately, so the exit
+# code is no longer part of the assertion: only "vm was not chosen" is.
 make_vm_fixture "$FIX2"
 rm -f "$FIX2/state/base.qcow2" "$FIX2/state/vmlinuz"
 check "auto-detect never selects vm when the vm image is NOT built" \
-    "cd '$FIX2/project' && LLMBOX_STATE_DIR='$FIX2/state' '$BOC' llm-in-a-box-vmtest >/tmp/llm-in-a-box-vmp2.log 2>&1; [ \$? -ne 0 ] \
-        && ! grep -q 'Auto-detected runtime: vm' /tmp/llm-in-a-box-vmp2.log"
+    "cd '$FIX2/project' && LLMBOX_STATE_DIR='$FIX2/state' '$BOC' llm-in-a-box-vmtest </dev/null >/tmp/llm-in-a-box-vmp2.log 2>&1; \
+        ! grep -q 'Auto-detected runtime: vm' /tmp/llm-in-a-box-vmp2.log"
 # The no-image error can only appear when NO llm-in-a-box:* image exists
 # locally; skip-not-fail once ANY image is built (detection then falls
 # back to docker/sysbox, which is also a correct not-vm outcome — the

@@ -50,6 +50,11 @@
 # ---------------------------------------------------------------------------
 set -uo pipefail
 
+# A plain umask (2026-10-25): fixtures that write config files the launcher
+# reads must not inherit a group-writable umask — `lbx` refuses a config that
+# group or others can write. See tests/run-all-suites.sh for the measurement.
+umask 022
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BOC="${LBX_BIN:-${SCRIPT_DIR}/../target/debug/lbx}"
 export LLMBOX_SCRIPT_DIR="$SCRIPT_DIR/.."

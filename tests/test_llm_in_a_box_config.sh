@@ -159,9 +159,19 @@ seed_refs() {
     printf '%b\n' "$refs" >> "/tmp/llmcfg-exist-$tag"
 }
 
+# The fixtures below write a config file the launcher reads. `lbx` refuses a
+# config that group or others can write (a real user's config is private), so a
+# group-writable umask would turn every config check red: measured 2026-10-25,
+# `umask 002` on the host turned 58 passes into 32 failures with no code change.
+# A plain umask here makes the suite independent of the invoking shell.
+umask 022
+
 write_cfg() {
     local tag="$1" content="$2"
     printf '%b' "$content" > "/tmp/llmcfg-cfg-$tag"
+    # Private, like a user's own config: nothing about the ambient umask may
+    # decide whether the launcher accepts this fixture.
+    chmod 600 "/tmp/llmcfg-cfg-$tag" 2>/dev/null || true
 }
 
 # The env prefix used inside check strings (evaluated by eval at check

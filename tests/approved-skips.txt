@@ -88,3 +88,14 @@ test_llm_in_a_box_sessions.sh|existing vm session is attached to instead of re-l
 test_llm_in_a_box_sessions.sh|vm relaunch mounts the RECORDED origin directory
 test_llm_in_a_box_sessions.sh|legacy vm session (no origin file) mounts the current pwd
 test_llm_in_a_box_sessions.sh|versioned-base session checks
+
+# Checks that need the root-made fixtures of tests/setup-run-test-host.sh (a
+# second test user with non-1000 ids, a sudo rule to act as it, and the
+# anomalous directories/devices/sockets under /srv/lbx-test-fixtures). They are
+# SKIPS, not passes: the rules are never exercised without the fixtures. They
+# are approved because provisioning a host is the operator's call — measured
+# 2026-10-25 on a host whose owner declined ("I'm not adding a user to my
+# host"). On a host that ran the setup script these checks run for real.
+test_llm_in_a_box_run.sh|RUN3 every data-directory rule
+test_llm_in_a_box_run.sh|RUN99 every socket-directory rule
+verify-run-unattended.sh|VRUN2

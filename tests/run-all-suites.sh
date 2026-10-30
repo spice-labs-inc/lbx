@@ -46,7 +46,15 @@
 # ---------------------------------------------------------------------------
 set -uo pipefail
 
-# LBX_BIN from the environment passes through to every suite; --lbx sets it.
+# A plain umask, for every suite: several fixtures write config files that the
+# launcher reads, and `lbx` refuses a config that group or others can write.
+# Measured 2026-10-25 on a host whose shell has umask 002: the config suite went
+# 58 passed / 0 failed -> 26 / 32 with no code change, and the sessions suite
+# lost its four config-key checks. CI already exported this before running us
+# ("the runner process starts with a group-writable umask"); doing it here makes
+# a local run behave the same as CI, and the suites repeat it so they are also
+# correct when run one at a time.
+umask 022
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SUITES_DIR="$HERE"

@@ -45,6 +45,11 @@
 # ---------------------------------------------------------------------------
 set -uo pipefail
 
+# A plain umask (2026-10-25): fixtures that write config files the launcher
+# reads must not inherit a group-writable umask — `lbx` refuses a config that
+# group or others can write. See tests/run-all-suites.sh for the measurement.
+umask 022
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LBX="${LBX_BIN:-$SCRIPT_DIR/../target/debug/lbx}"
 export LLMBOX_SCRIPT_DIR="$SCRIPT_DIR/.."
@@ -80,14 +85,49 @@ check() {
     if [ -n "${LBX_TEST_ONLY:-}" ] && [ "${description#"$LBX_TEST_ONLY"}" = "$description" ]; then
         return 0
     fi
-    local started=$SECONDS
-    if "$@"; then
+    local started=$SECONDS rc=0
+    SKIP_REASON=""
+    "$@" || rc=$?
+    if [ "$rc" = 0 ]; then
         echo "[PASS] $description ($((SECONDS - started)) s)"
         PASS=$((PASS + 1))
+    elif [ "$rc" = 77 ] && [ -n "$SKIP_REASON" ]; then
+        echo "[SKIP] $description ($SKIP_REASON)"
+        SKIP=$((SKIP + 1))
     else
         echo "[FAIL] $description ($((SECONDS - started)) s)"
         FAIL=$((FAIL + 1))
     fi
+}
+
+# ── Root-made fixtures (tests/setup-run-test-host.sh) ─────────────────────
+# RUN3 and RUN99 test the data- and socket-directory rules against REAL
+# anomalies: a directory owned by someone else, a mount point, a device file, a
+# socket owned by another user, /run/user/<uid>. Only root can create those, so
+# a host that has not been provisioned cannot exercise those sub-cases.
+#
+# That is neither a pass nor a failure: the rule was never exercised, and
+# nothing is broken. A check function that sets SKIP_REASON and returns 77 is
+# reported as [SKIP] (the convention verify-run-unattended.sh already uses), and
+# tests/approved-skips.txt approves those two skips for operators who decline to
+# run the setup script on their own host (2026-10-25, owner: "I'm not adding a
+# user to my host"). On a provisioned host every sub-case runs and the checks are
+# PASS/FAIL exactly as before.
+FIXTURES_MISSING=()
+need_fixture() { FIXTURES_MISSING+=("$1"); }
+fixtures_skip_reason() {
+    local IFS=', '
+    printf 'needs root-made fixtures (sudo bash tests/setup-run-test-host.sh): %s' "${FIXTURES_MISSING[*]}"
+}
+# The verdict for a check whose sub-cases ran: a real failure wins, then a
+# missing fixture, then success.
+fixtures_verdict() { # <ok>
+    [ "$1" -eq 0 ] || return 1
+    if [ "${#FIXTURES_MISSING[@]}" -gt 0 ]; then
+        SKIP_REASON="$(fixtures_skip_reason)"
+        return 77
+    fi
+    return 0
 }
 
 # ── Random values, drawn only in this shell ───────────────────────────────
@@ -459,6 +499,7 @@ run3_case() { # <description> <message fragment> <data dir> [policy file]
 run3() {
     local R; fixture run3; R="$(R_of run3)"
     local H="$R/hbase/home" ok=0
+    FIXTURES_MISSING=()
     printf 'x\n' > "$R/plainfile"
     mkdir -p "$R/d-git-top/.git" "$R/d-git-deep/a/b/c"; : > "$R/d-git-deep/a/b/c/.git"
     mkdir -p "$R/d-link"; : > "$R/d-link/target"; ln -s target "$R/d-link/link"
@@ -471,7 +512,7 @@ run3() {
     if [ -d "$FIX/root-owned" ] && [ -z "$(ls -A "$FIX/root-owned")" ]; then
         run3_case "not owned" "not owned by" "$FIX/root-owned" || ok=1
     else
-        echo "    prerequisite: an empty $FIX/root-owned (run tests/setup-run-test-host.sh)"; ok=1
+        need_fixture "an empty $FIX/root-owned (owned by root)"
     fi
     run3_case ".git at top level" ".git" "$R/d-git-top" || ok=1
     run3_case ".git three levels down" ".git" "$R/d-git-deep" || ok=1
@@ -479,7 +520,7 @@ run3() {
     if [ -d "$FIX/foreign-entry" ]; then
         run3_case "entry owned by another user" "owned by another user" "$FIX/foreign-entry" || ok=1
     else
-        echo "    prerequisite: $FIX/foreign-entry (run tests/setup-run-test-host.sh)"; ok=1
+        need_fixture "$FIX/foreign-entry (a directory of yours holding a root-owned entry)"
     fi
     mkdir -p "$R/d-fifo"; mkfifo "$R/d-fifo/pipe"
     run3_case "named pipe inside" "named pipe" "$R/d-fifo" || ok=1
@@ -496,12 +537,12 @@ run3() {
     if [ -S "$FIX/with-socket/sock" ]; then
         run3_case "socket inside" "socket" "$FIX/with-socket" || ok=1
     else
-        echo "    prerequisite: a socket at $FIX/with-socket/sock (run tests/setup-run-test-host.sh)"; ok=1
+        need_fixture "a socket at $FIX/with-socket/sock"
     fi
     if [ -c "$FIX/with-device/null" ]; then
         run3_case "device file inside" "device file" "$FIX/with-device" || ok=1
     else
-        echo "    prerequisite: a character device at $FIX/with-device/null (run tests/setup-run-test-host.sh)"; ok=1
+        need_fixture "a character device at $FIX/with-device/null"
     fi
     local U="$WORKROOT/run3-unreadable"
     rm -rf "$U"; mkdir -p "$U/sub"; printf 'x\n' > "$U/sub/file"; chmod 000 "$U/sub"
@@ -550,7 +591,7 @@ run3() {
     succeeded run3 || { echo "    control: a clean data directory"; ok=1; }
     run_lbx run3 --run --runtime docker --net-policy "$R/pol/policy.json" --data "$R/d-hardin" --timeout 30 r3h -- true
     succeeded run3 || { echo "    control: two names for one file, both inside the data directory"; ok=1; }
-    return $ok
+    fixtures_verdict $ok
 }
 check "RUN3 every data-directory rule refuses on its own, naming the rule" run3
 
@@ -4144,12 +4185,13 @@ path_within_t() { [ "$1" = "$2" ] || [[ "$1" == "$2"/* ]]; }
 # whichever way the cases end, so nothing leaks into the next check.
 run99() {
     local rc=0
-    run99_cases || rc=1
+    run99_cases || rc=$?
     EXTRA_ENV=(); RUN99_DATA=""; RUN99_POLICY=""; RUN99_SD_SNAPSHOT=yes
     return $rc
 }
 run99_cases() {
     local R ok=0; fixture run99; R="$(R_of run99)"
+    FIXTURES_MISSING=()
     local H="$R/hbase/home" X="$R/xdg"
     sock_dir "$X"
     local XENV=(XDG_RUNTIME_DIR="$X")
@@ -4167,7 +4209,7 @@ run99_cases() {
     if [ -d "$FIX/root-owned" ] && [ -z "$(ls -A "$FIX/root-owned")" ]; then
         run99_case "not owned" "not owned by" "$FIX/root-owned" || ok=1
     else
-        echo "    prerequisite: an empty $FIX/root-owned (run tests/setup-run-test-host.sh)"; ok=1
+        need_fixture "an empty $FIX/root-owned (owned by root)"
     fi
     sock_dir "$R/m720" 720; sock_dir "$R/m702" 702
     run99_case "group-writable" "writable by group or others" "$R/m720" || ok=1
@@ -4240,7 +4282,7 @@ run99_cases() {
         run99_case "/run/user/<uid> with XDG_RUNTIME_DIR elsewhere" "user runtime directory" "$RU" || ok=1
         RUN99_SD_SNAPSHOT=yes
     else
-        echo "    prerequisite: $RU owned by the invoking user with mode 700 and the scratch directory (TMPDIR) outside it (run tests/setup-run-test-host.sh)"; ok=1
+        need_fixture "$RU owned by the invoking user with mode 700 and the scratch directory (TMPDIR) outside it"
     fi
     sock_dir "$R/e-file"; printf 'token\n' > "$R/e-file/token"
     run99_case "holding a regular file" "not a socket" "$R/e-file" || ok=1
@@ -4253,12 +4295,12 @@ run99_cases() {
     if [ -c "$FIX/with-device/null" ] && [ "$(stat -c %u "$FIX/with-device")" = "$(id -u)" ] && [ $(( 8#$(stat -c %a "$FIX/with-device") & 8#022 )) = 0 ]; then
         run99_case "holding a device file" "not a socket" "$FIX/with-device" || ok=1
     else
-        echo "    prerequisite: a character device at $FIX/with-device/null, in a directory owned by the invoking user and not writable by group or others (run tests/setup-run-test-host.sh)"; ok=1
+        need_fixture "a character device at $FIX/with-device/null, in a directory owned by the invoking user and not writable by group or others"
     fi
     if [ -S "$FIX/with-foreign-socket/sock" ]; then
         run99_case "holding a socket owned by another user" "owned by another user" "$FIX/with-foreign-socket" || ok=1
     else
-        echo "    prerequisite: a root-owned socket at $FIX/with-foreign-socket/sock (run tests/setup-run-test-host.sh)"; ok=1
+        need_fixture "a root-owned socket at $FIX/with-foreign-socket/sock"
     fi
     sock_dir "$R/c-ssh"; make_socket "$R/c-ssh/agent.sock" || return 1
     EXTRA_ENV=("${XENV[@]}" SSH_AUTH_SOCK="$R/c-ssh/agent.sock")
@@ -4307,7 +4349,7 @@ run99_cases() {
     sock_dir "$X/job"; make_socket "$X/job/s.sock" || return 1
     run99_runs "inside the user runtime directory" "$X/job" || ok=1
     EXTRA_ENV=()
-    return $ok
+    fixtures_verdict $ok
 }
 check "RUN99 every socket-directory rule refuses on its own, naming the rule" run99
 

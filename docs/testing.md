@@ -62,13 +62,20 @@ A single suite still runs on its own, for example
 
 ### Before a local run
 
-Two things are **per boot** and are not installed anywhere, so a host that has
-run the suites before can still be missing them:
+Three things are **per boot** or **per host** and are not installed anywhere, so
+this checklist is worth a glance before reading a red run:
 
+- **A plain umask.** `lbx` refuses a config file that group or others can write.
+  `run-all-suites.sh` (and each suite on its own) now sets `umask 022` itself, so
+  a shell with a group-writable umask no longer turns the config checks red.
 - `sudo bash tests/setup-run-test-host.sh <your user>`: the fixtures under
   `/srv/lbx-test-fixtures`, the sudo rule for the test user, and the AppArmor
   profiles. The profiles are loaded with `apparmor_parser` from this tree, not
-  installed into `/etc/apparmor.d`, so they are gone after a reboot. The script
+  installed into `/etc/apparmor.d`, so they are gone after a reboot.
+  **Provisioning the host is optional**: it creates a `lbxtest` user, a sudoers
+  rule and root-owned fixtures. Without it, the three checks that need them
+  (`RUN3`, `RUN99`, `VRUN2`) report `[SKIP]` with the reason instead of failing,
+  and those skips are approved in `tests/approved-skips.txt`. The script
   is idempotent; it also puts you in the `kvm` group when `/dev/kvm` exists
   (which needs a new login to take effect) and reports whether
   `qemu-system-x86_64` is installed; `qemu-img` alone is not enough for the

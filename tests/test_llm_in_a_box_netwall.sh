@@ -39,6 +39,10 @@ RELAY_IMAGE="${LBX_TEST_RELAY_IMAGE:-llm-in-a-box-relay:latest}"
 BOC="${LBX_BIN:-${SCRIPT_DIR}/../target/debug/lbx}"
 export LLMBOX_SCRIPT_DIR="$SCRIPT_DIR/.."
 
+# A plain umask: the policy fixtures below are written here and read by the
+# relay and the launcher. See tests/run-all-suites.sh for why (2026-10-25).
+umask 022
+
 PASS=0
 FAIL=0
 SKIP=0
@@ -276,7 +280,14 @@ fi
 
 if [ "$HAVE_SESSIONS" = 1 ]; then
     # ── T6: walled session — deny/allow pair + env + wiring ───────────────
-    cd $NETFIX && "$BOC" --net-policy "$NETPOL" "$SESS" </dev/null >/tmp/netwall-t6.log 2>&1 || true
+    # `--runtime docker` is REQUIRED (2026-10-25 incident): these checks assert
+    # on CONTAINERS, but auto-detect prefers vm as soon as a vm base exists
+    # (`lbx` pushes vm first when built), so after a `./build all` on the host
+    # this session silently became a 16 GiB KVM guest — no container, no relay
+    # label, and the deny/DNS checks below "passed" vacuously because
+    # `docker exec` failed. The runtime is pinned here and in T12, and the two
+    # vacuous checks now require the container to exist.
+    cd $NETFIX && "$BOC" --runtime docker --net-policy "$NETPOL" "$SESS" </dev/null >/tmp/netwall-t6.log 2>&1 || true
     # The entrypoint renames the box user to the host user (lbx passes
     # HOST_USER=$(whoami) and HOST_UID); wait for its setup to finish, then
     # exec as that user.
@@ -308,7 +319,8 @@ if [ "$HAVE_SESSIONS" = 1 ]; then
     check "proxy env is persisted for interactive shells (profile.d)" \
         "docker exec -u "$SUSER_UID:$SUSER_GID" $SESS bash -lc 'echo \$HTTP_PROXY' 2>/dev/null | grep >/dev/null llm-in-a-box-relay-$SESS"
     check "enforce: example.com denied inside the session" \
-        "docker exec -u "$SUSER_UID:$SUSER_GID" $SESS bash -lc 'curl -s --max-time 20 -o /dev/null -w %{http_code} https://example.com' >/tmp/netwall-example.out 2>&1; [ \$? -ne 0 ] || ! grep -qE '2[0-9][0-9]|3[0-9][0-9]' /tmp/netwall-example.out"
+        "docker container inspect $SESS >/dev/null 2>&1 \
+            && docker exec -u "$SUSER_UID:$SUSER_GID" $SESS bash -lc 'curl -s --max-time 20 -o /dev/null -w %{http_code} https://example.com' >/tmp/netwall-example.out 2>&1; [ \$? -ne 0 ] || ! grep -qE '2[0-9][0-9]|3[0-9][0-9]' /tmp/netwall-example.out"
     check "enforce: api.anthropic.com succeeds inside the session" \
         "docker exec -u "$SUSER_UID:$SUSER_GID" $SESS bash -lc 'curl -s --max-time 25 -o /dev/null -w %{http_code} https://api.anthropic.com' 2>/dev/null | grep -v >/dev/null 000"
 
@@ -321,7 +333,8 @@ if [ "$HAVE_SESSIONS" = 1 ]; then
 
     # ── T9: no DNS / no route out ─────────────────────────────────────────
     check "dig @8.8.8.8 times out inside the walled session" \
-        "docker exec -u "$SUSER_UID:$SUSER_GID" $SESS bash -lc 'timeout 8 dig @8.8.8.8 example.com +short' 2>/dev/null; [ \$? -ne 0 ]"
+        "docker container inspect $SESS >/dev/null 2>&1 \
+            && docker exec -u "$SUSER_UID:$SUSER_GID" $SESS bash -lc 'timeout 8 dig @8.8.8.8 example.com +short' 2>/dev/null; [ \$? -ne 0 ]"
 
     # ── T10: JVM tools work with only JAVA_TOOL_OPTIONS (from profile.d) ──
     check "mvn dependency:get succeeds with only the JVM proxy options" \
@@ -375,7 +388,7 @@ fi
 # ── T12: no policy = no wall (D3 default) ─────────────────────────────────
 if [ "$HAVE_SESSIONS" = 1 ]; then
     SESS2="llm-in-a-box-netsess2-$$"
-    cd $NETFIX && "$BOC" "$SESS2" </dev/null >/tmp/netwall-t12.log 2>&1 || true
+    cd $NETFIX && "$BOC" --runtime docker "$SESS2" </dev/null >/tmp/netwall-t12.log 2>&1 || true
     for _ in $(seq 1 30); do
         [ "$(docker container inspect -f '{{.State.Status}}' "$SESS2" 2>/dev/null)" = running ] && break
         sleep 1
