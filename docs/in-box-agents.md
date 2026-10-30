@@ -82,7 +82,12 @@ installed, so the file only matters if you install it.
 
 Both run from their built-in provider lists; the image ships no provider
 configuration for them. OMP is a Bun-only build, so Bun is installed next
-to Node.js (the build fails if `omp --version` does not run). Authenticate
+to Node.js (the build fails if `omp --version` does not run). The Bun pin
+(`ARG BUN_VERSION`) must stay at or above the `engines.bun` floor that the
+installed `@oh-my-pi/pi-coding-agent` declares — the agents are installed
+unpinned, so upstream can raise that floor and break the image build until the
+pin is bumped (`npm view @oh-my-pi/pi-coding-agent engines.bun`; 2026-10-25:
+floor 1.4.4, pin raised from 1.4.0). Authenticate
 with `ANTHROPIC_API_KEY` or `/login` inside the agent; OMP also takes
 `ZAI_API_KEY` and `/login kimi-code`. For Umans models in OMP, write your
 own `~/.omp/agent/models.yml` with a provider block pointing at

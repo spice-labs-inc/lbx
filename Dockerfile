@@ -240,10 +240,18 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 
 # ── Bun runtime (required by OMP) ───────────────────────────────────────────
 # @oh-my-pi/pi-coding-agent (the `omp` binary) ships a Bun-only bundle:
-# dist/cli.js has shebang `#!/usr/bin/env bun` and package.json declares
-# engines.bun >=1.3.14 with no Node fallback. Without Bun, `omp` cannot
-# execute at all — this is a hard runtime dependency, not an optional one.
-ARG BUN_VERSION=1.4.0
+# dist/cli.js has shebang `#!/usr/bin/env bun` and package.json declares an
+# engines.bun floor with no Node fallback. Without Bun, `omp` cannot execute at
+# all — this is a hard runtime dependency, not an optional one.
+#
+# THE PIN MUST SATISFY omp'S CURRENT FLOOR, and the floor moves with upstream
+# because the agent packages are installed unpinned. It was >=1.3.14 (Bun
+# 1.4.0 here), and on 2026-10-25 omp 18.14.0 raised it to >=1.4.4: the pinned
+# 1.4.0 made `omp --version` fail and took down EVERY image build (sysbox,
+# docker and vm) at step 25/47 with "Bun runtime must be >= 1.4.4". Check the
+# floor when this pin ages, and bump it when it does:
+#   npm view @oh-my-pi/pi-coding-agent engines.bun
+ARG BUN_VERSION=1.4.4
 ENV BUN_INSTALL=/home/agent/.bun
 ENV PATH="${BUN_INSTALL}/bin:${PATH}"
 RUN curl -fsSL https://bun.sh/install | bash -s -- "bun-v${BUN_VERSION}"
@@ -273,8 +281,13 @@ RUN npm install -g \
 # (a broken `omp` install must not pass silently as done)
 # The env -i run resolves bun ONLY via the system-PATH symlink — the exact
 # context the vm guest's ssh-exec probes use (2026-09-02).
+# The trailing message matters: without it the operator sees a wall of build
+# log and one buried upstream line ("Bun runtime must be >= 1.4.4 …"), which
+# is how the 2026-10-25 breakage read. It names the pin and the command that
+# reports the floor.
 RUN bun --version && omp --version \
-    && env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin omp --version
+    && env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin omp --version \
+    || { echo "ERROR: the Bun/OMP smoke test above failed. If it says the Bun runtime is too old, the pinned BUN_VERSION is below omp's engines.bun floor: check 'npm view @oh-my-pi/pi-coding-agent engines.bun' and raise the pin. (2026-10-25: omp 18.14.0 raised the floor to >=1.4.4 and the pinned 1.4.0 broke every image build.)" >&2; exit 1; }
 
 # ── umans.ai CLI (managed LLM endpoint for Claude Code) ──────────────────
 RUN curl -fsSL https://api.code.umans.ai/cli/install.sh | bash \
