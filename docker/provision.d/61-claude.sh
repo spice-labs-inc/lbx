@@ -12,7 +12,7 @@ set -euo pipefail
 log "installing @anthropic-ai/claude-code (latest)"
 as_root_npm install -g @anthropic-ai/claude-code
 
-if ! claude --version; then
+if ! as_box claude --version; then
     echo "ERROR: claude did not install or does not run." >&2
     exit 1
 fi

@@ -1,5 +1,6 @@
 # Rust build output of the launcher crate
 target/
+workspace/
 
 # Claude Code per-machine local settings (shared settings belong in
 # .claude/settings.json, which stays tracked)

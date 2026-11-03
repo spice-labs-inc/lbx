@@ -82,12 +82,26 @@ as_box() {
     fi
 }
 
-# npm's global tree is /usr/local/lib/node_modules, so this needs root. The
-# cache lives under /root so a root-owned entry never breaks the box user's
-# own npm.
+# npm's global tree is /usr/local/lib/node_modules, so this needs root. HOME is
+# ROOT's, not the box user's: a package's postinstall writes `$HOME/.local/…`
+# regardless of the XDG variables — measured: opencode's install created
+# /home/agent/.local/state/opencode owned by root, which the full image's old
+# `chown -R /home/agent` had been masking. Nothing an install creates should
+# land in the box user's home; the tools make their own config at first use.
+# The box user still gets `pi install` (as_box) for everything that belongs to
+# them. Everything an install may create belongs to ROOT, not to the box:
+#   * the npm cache, and
+#   * the XDG dirs a package's postinstall may write — measured: opencode's
+#     install created /home/agent/.local/state/opencode owned by root, which
+#     the full image's old `chown -R /home/agent` had been masking. The build
+#     now asserts ownership, so this is the cause and not the repair.
 as_root_npm() {
-    $SUDO env HOME="$BOX_HOME" NPM_CONFIG_CACHE=/root/.npm npm "$@"
-    $SUDO rm -rf /root/.npm
+    $SUDO env HOME=/root NPM_CONFIG_CACHE=/root/.npm \
+        XDG_STATE_HOME=/root/.local/state \
+        XDG_CACHE_HOME=/root/.cache \
+        XDG_CONFIG_HOME=/root/.config \
+        npm "$@"
+    $SUDO rm -rf /root/.npm /root/.local /root/.cache/npm /root/.config/npm
 }
 
 # Symlink every cargo toolchain binary into /usr/local/bin. The image's ENV

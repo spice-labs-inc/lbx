@@ -27,8 +27,8 @@ fi
 log "installing @oh-my-pi/pi-coding-agent (latest)"
 as_root_npm install -g @oh-my-pi/pi-coding-agent
 
-if ! bun --version || ! omp --version \
-    || ! env -i PATH="$SYS_PATH" omp --version; then
+if ! as_box bun --version || ! as_box omp --version \
+    || ! env -i HOME=/tmp PATH="$SYS_PATH" omp --version; then
     echo "ERROR: the Bun/OMP smoke test above failed. If it says the Bun runtime" >&2
     echo "       is too old, BUN_VERSION is below omp's engines.bun floor: check" >&2
     echo "       'npm view @oh-my-pi/pi-coding-agent engines.bun' and raise it." >&2

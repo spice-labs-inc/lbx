@@ -7,7 +7,7 @@ set -euo pipefail
 log "installing opencode-ai (latest)"
 as_root_npm install -g opencode-ai
 
-if ! opencode --version; then
+if ! as_box opencode --version; then
     echo "ERROR: opencode did not install or does not run." >&2
     exit 1
 fi

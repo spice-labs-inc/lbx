@@ -25,7 +25,7 @@ fi
 $SUDO ln -sfn "$BOX_HOME/.bun/bin/bun" /usr/local/bin/bun
 $SUDO ln -sfn "$BOX_HOME/.bun/bin/bunx" /usr/local/bin/bunx
 
-if ! bun --version; then
+if ! as_box bun --version; then
     echo "ERROR: bun did not install or does not run." >&2
     exit 1
 fi
