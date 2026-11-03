@@ -138,7 +138,6 @@ fn run_only_flags_probe_lines() {
         ("--socket-dir", vec!["/x"]),
         ("--data", vec!["/x"]),
         ("--timeout", vec!["5"]),
-        ("--env", vec!["X"]),
         ("--apparmor-profile", vec![]),
     ] {
         let mut c = lbx(&w);

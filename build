@@ -2,7 +2,7 @@
 # ---------------------------------------------------------------------------
 # build — build llm-in-a-box image(s) for a runtime, plus the vm base disk.
 #
-# Usage:  ./build <sysbox|docker|vm|relay|all> [--check]
+# Usage:  ./build [--slim|--full] <sysbox|docker|vm|relay|all> [--check]
 #         ./build relay [--label KEY=VALUE]...
 #
 #   sysbox   Build image for sysbox (requires docker)
@@ -13,6 +13,16 @@
 #   all      Build all of the above: sysbox, docker, relay, and the vm image +
 #            base disk. Unlike `./build vm` alone, `all` REBUILDS the vm image
 #            (a base disk is only as new as the rootfs it was built from).
+#
+# Modes (both images come from the same Dockerfile and the same provisioning
+# steps in docker/provision.d/, so they cannot drift):
+#   --full   the image that ships today: everything installed at build time
+#            (llm-in-a-box:<runtime>). This is the default, unchanged.
+#   --slim   OS + box identity + docker/node/gh/CLI tools, plus lbx-setup and
+#            the provisioning steps; capabilities are installed inside the box
+#            (llm-in-a-box:<runtime>-slim).
+#   (none)   same as --full for a single runtime; `all` builds BOTH, slim
+#            first, because the full image is built FROM the slim image.
 #
 #   --check  (vm only) run the vm build-prereq checks and exit; does not build.
 #   --label  (relay only, repeatable) add an image label KEY=VALUE to the
@@ -69,6 +79,21 @@ for _kv in $IMAGES; do
         vm=*) IMAGE_VM="${_kv#vm=}" ;;
     esac
 done
+# The slim refs come from the same resolver (`--print-images --slim`), so a
+# build and a launch still cannot disagree. An older launcher without the flag
+# is tolerated: the slim tag is derived the same way its config default is.
+if IMAGES_SLIM="$("$LBX_BIN" --print-images --slim 2>/dev/null)"; then
+    for _kv in $IMAGES_SLIM; do
+        case "$_kv" in
+            sysbox=*) IMAGE_SYSBOX_SLIM="${_kv#sysbox=}" ;;
+            docker=*) IMAGE_DOCKER_SLIM="${_kv#docker=}" ;;
+            vm=*) IMAGE_VM_SLIM="${_kv#vm=}" ;;
+        esac
+    done
+fi
+: "${IMAGE_SYSBOX_SLIM:=${IMAGE_SYSBOX}-slim}"
+: "${IMAGE_DOCKER_SLIM:=${IMAGE_DOCKER}-slim}"
+: "${IMAGE_VM_SLIM:=${IMAGE_VM}-slim}"
 
 # The state directory the launcher resolved (see the block above): the one
 # place base disks, `latest` and the transient build staging live.
@@ -87,7 +112,7 @@ BUILD_VM_MISSING="${BUILD_VM_MISSING:-}"
 
 usage() {
     cat >&2 <<'EOF'
-Usage: ./build <sysbox|docker|vm|relay|all> [--check]
+Usage: ./build [--slim|--full] <sysbox|docker|vm|relay|all> [--check]
        ./build relay [--label KEY=VALUE]...
 
 Runtimes:
@@ -98,6 +123,14 @@ Runtimes:
   relay    Build the netwall relay image (llm-in-a-box-relay)
   all      Build all of the above, rebuilding the vm image
 
+Modes:
+  --full   install everything at build time (llm-in-a-box:<runtime>)
+           Default for a single runtime.
+  --slim   ship the provisioning steps and install on demand inside the box
+           with lbx-setup (llm-in-a-box:<runtime>-slim)
+  neither  `all` builds BOTH (slim first: the full image is FROM the slim
+           image); a single runtime builds --full, as it always has.
+
 Options:
   --check  (vm only) run vm build-prereq checks and exit; does not build.
   --label  (relay only, repeatable) add the image label KEY=VALUE.
@@ -105,21 +138,38 @@ EOF
     exit 1
 }
 
+# Mode flags may precede the runtime (./build --slim all) or follow it.
+BUILD_SLIM=false
+BUILD_FULL=false
+while [ $# -ge 1 ]; do
+    case "$1" in
+        --slim) BUILD_SLIM=true; shift ;;
+        --full) BUILD_FULL=true; shift ;;
+        *) break ;;
+    esac
+done
 [ $# -ge 1 ] || usage
 RUNTIME="$1"; shift
 CHECK=false
 RELAY_LABELS=()
-if [ $# -ge 1 ] && [ "$1" = "--check" ]; then
-    CHECK=true
-else
-    while [ $# -ge 1 ]; do
-        [ "$1" = "--label" ] && [ $# -ge 2 ] || usage
-        case "$2" in
-            [!=]*=*) RELAY_LABELS+=(--label "$2") ;;
-            *) echo "ERROR: --label needs KEY=VALUE, got '$2'." >&2; exit 1 ;;
-        esac
-        shift 2
-    done
+while [ $# -ge 1 ]; do
+    case "$1" in
+        --check) CHECK=true; shift ;;
+        --slim) BUILD_SLIM=true; shift ;;
+        --full) BUILD_FULL=true; shift ;;
+        --label)
+            [ $# -ge 2 ] || usage
+            case "$2" in
+                [!=]*=*) RELAY_LABELS+=(--label "$2") ;;
+                *) echo "ERROR: --label needs KEY=VALUE, got '$2'." >&2; exit 1 ;;
+            esac
+            shift 2 ;;
+        *) usage ;;
+    esac
+done
+if [ "$BUILD_SLIM" = true ] && [ "$BUILD_FULL" = true ]; then
+    echo "ERROR: --slim and --full are mutually exclusive." >&2
+    exit 1
 fi
 
 case "$RUNTIME" in
@@ -198,20 +248,22 @@ build_relay() {
     echo "==> Built llm-in-a-box-relay:latest successfully."
 }
 
+build_stamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
 build_docker_image() {
     local runtime="$1"
-    local tag
+    local provision="${2:-full}"
+    local tag slim_tag target label
     case "$runtime" in
-        sysbox) tag="$IMAGE_SYSBOX" ;;
-        docker) tag="$IMAGE_DOCKER" ;;
-        vm) tag="$IMAGE_VM" ;;
+        sysbox) tag="$IMAGE_SYSBOX"; slim_tag="$IMAGE_SYSBOX_SLIM" ;;
+        docker) tag="$IMAGE_DOCKER"; slim_tag="$IMAGE_DOCKER_SLIM" ;;
+        vm) tag="$IMAGE_VM"; slim_tag="$IMAGE_VM_SLIM" ;;
         *) echo "ERROR: unknown runtime '$runtime'." >&2; return 1 ;;
     esac
     if ! command -v docker &>/dev/null; then
         echo "ERROR: docker is required to build the $runtime image but is not installed." >&2
         return 1
     fi
-    echo "==> Building $tag ..."
     # NOTE: must not rely on set -e here — the caller invokes this function
     # in a `|| return` context, which disables -e for the WHOLE function
     # body, so a failed docker build would silently fall through to the
@@ -219,9 +271,33 @@ build_docker_image() {
     # base-disk stage ran with no image). Capture the exit explicitly, and
     # also verify the tag actually landed (belt and suspenders against
     # buildkit reporting success without the image being present).
+    if [ "$provision" = slim ]; then
+        tag="$slim_tag"
+        target=slim
+        label=core
+    else
+        target=full
+        label=full
+        # The full image is built FROM the slim image, so the slim build is a
+        # real prerequisite (an image parent, not a build cache — this works
+        # with --no-cache, which is off the table to remove).
+        # The full image is built FROM the slim image, so the slim build is a
+        # prerequisite. An existing installation (or a first build after the
+        # split) has no slim image yet: build it rather than refusing, so
+        # `./build docker` keeps working exactly as it always did.
+        if ! docker image inspect "$slim_tag" >/dev/null 2>&1; then
+            echo "==> the full $runtime image is built FROM '$slim_tag' (missing): building the slim parent first"
+            build_docker_image "$runtime" slim || return 1
+        fi
+    fi
+    echo "==> Building $tag ($provision: target=$target) ..."
     docker build \
         --no-cache \
+        --target "$target" \
         --build-arg "RUNTIME_TYPE=${runtime}" \
+        --build-arg "SLIM_IMAGE=${slim_tag}" \
+        --label "llm-in-a-box.provision=${label}" \
+        --label "llm-in-a-box.built-at=$(build_stamp)" \
         -t "$tag" \
         "$SCRIPT_DIR" || { echo "ERROR: docker build failed for $tag." >&2; return 1; }
     if ! docker image inspect "$tag" >/dev/null 2>&1; then
@@ -278,7 +354,7 @@ build_vm_base_disk() {
     mkdir -p "$STATE_DIR"
 
     local cid
-    cid=$(docker create "$IMAGE_VM")
+    cid=$(docker create "$MODE_IMAGE_VM")
     docker export "$cid" -o "$work/rootfs.tar"
     docker rm "$cid" >/dev/null
     # Provenance record (2026-09-14): which image this base was built
@@ -293,14 +369,18 @@ build_vm_base_disk() {
     # image id is the content: vm::preflight warns when the configured image
     # no longer matches it. No id line means docker could not report one
     # (older bases, unusual clients): the tag compare then applies.
-    digest=$(docker image inspect --format '{{.RepoDigests}}' "$IMAGE_VM" 2>/dev/null || true)
+    digest=$(docker image inspect --format '{{.RepoDigests}}' "$MODE_IMAGE_VM" 2>/dev/null || true)
     digest=$(printf '%s' "$digest" | tr -d '[]' | cut -d' ' -f1)
-    [ -n "$digest" ] || digest="$IMAGE_VM"
-    image_id=$(docker image inspect --format '{{.Id}}' "$IMAGE_VM" 2>/dev/null | head -1 || true)
+    [ -n "$digest" ] || digest="$MODE_IMAGE_VM"
+    image_id=$(docker image inspect --format '{{.Id}}' "$MODE_IMAGE_VM" 2>/dev/null | head -1 || true)
     {
         printf '%s\n' "$digest"
         [ -z "$image_id" ] || printf 'image-id %s\n' "$image_id"
     } > "$staging/from-image"
+    # Mode stamp (2026-10-31): the launcher picks a base per image MODE, so a
+    # slim box never boots a fat base (or the reverse). Old bases have no
+    # stamp and are treated as full.
+    printf '%s\n' "$MODE_PROVISION" > "$staging/provision"
 
     echo "==> Building base image '$ts' (this can take a few minutes) ..."
     docker run --rm --entrypoint bash \
@@ -308,7 +388,7 @@ build_vm_base_disk() {
         -v "$work/rootfs.tar:/rootfs.tar:ro" \
         -v "$lwork:/work" \
         -v "$staging:/state" \
-        "$IMAGE_VM" -c '
+        "$MODE_IMAGE_VM" -c '
             set -e
             # Clean up transient inputs even when the build fails: the
             # invoking user cannot delete root-owned leftovers, and the
@@ -401,12 +481,29 @@ running_vm_sessions() {
 }
 
 build_vm() {
-    local running force_image="no"
+    # Positional, always: (rebuild|no-rebuild) (full|slim) (yes|no explicit).
+    # Deriving `provision` from $1 when rebuild was absent put the sentinel into
+    # the tag (measured: "Building llm-in-a-box:vm (no-rebuild: target=full)").
+    local running force_image="no" provision="${2:-full}" explicit="${3:-no}"
+    if [ "${1:-}" = rebuild ]; then
+        force_image="yes"
+    fi
+    # The mode selects both the image and the base disk: `./build --slim vm`
+    # builds a slim base, `./build vm` a full one, and the launcher picks the
+    # base stamped with the mode it is launching.
+    if [ "$provision" = slim ]; then
+        MODE_IMAGE_VM="$IMAGE_VM_SLIM"
+        MODE_PROVISION=core
+        MODE_DEFAULT_NAME="llm-in-a-box:vm-slim"
+    else
+        MODE_IMAGE_VM="$IMAGE_VM"
+        MODE_PROVISION=full
+        MODE_DEFAULT_NAME="llm-in-a-box:vm"
+    fi
     # `./build all` passes `rebuild`: it is a full rebuild, and a base disk
     # built from a REUSED image is silently stale (the other builds in `all`
     # run with --no-cache, this one used to be skipped whenever the image
     # existed). `./build vm` alone keeps the cheap path.
-    [ "${1:-}" = rebuild ] && force_image="yes"
     check_vm_prereqs || return 1
     # A running vm session no longer blocks the build: base images are
     # IMMUTABLE and versioned (bases/<ts>/), so a rebuild stages a fresh
@@ -417,31 +514,36 @@ build_vm() {
         echo "NOTE: a box vm session is running (${running% }) — it will keep using its"
         echo "      current base image; new sessions will use the new one."
     fi
-    if [ "$IMAGE_VM" = "llm-in-a-box:vm" ]; then
+    if [ "$MODE_IMAGE_VM" = "$MODE_DEFAULT_NAME" ]; then
         # Only the DEFAULT name is auto-built — never build the project image
         # under a user's tag (silent wrong-image substitution).
-        if [ "$force_image" = yes ] || ! docker image inspect "$IMAGE_VM" >/dev/null 2>&1; then
-            build_docker_image vm || return 1
+        # `./build --slim vm` / `./build --full vm` name a mode on purpose: the
+        # image is BUILT, not reused. Silently reusing it is how a base disk
+        # ends up built from an image that predates the provisioning scripts
+        # the caller just edited (measured: a rebuilt base carried an old
+        # lbx-setup, and the new box reproduced the old bug).
+        if [ "$force_image" = yes ] || [ "$explicit" = yes ] || ! docker image inspect "$MODE_IMAGE_VM" >/dev/null 2>&1; then
+            build_docker_image vm "$provision" || return 1
         else
-            echo "NOTE: using the existing vm image '$IMAGE_VM' (image build skipped —"
+            echo "NOTE: using the existing vm image '$MODE_IMAGE_VM' (image build skipped —"
             echo "      ./build all rebuilds it; ./build vm reuses an existing one)."
         fi
-    elif ! docker image inspect "$IMAGE_VM" >/dev/null 2>&1; then
-        echo "ERROR: configured vm image '$IMAGE_VM' is not present locally; pull it first:" >&2
-        echo "       docker pull $IMAGE_VM" >&2
+    elif ! docker image inspect "$MODE_IMAGE_VM" >/dev/null 2>&1; then
+        echo "ERROR: configured vm image '$MODE_IMAGE_VM' is not present locally; pull it first:" >&2
+        echo "       docker pull $MODE_IMAGE_VM" >&2
         return 1
     elif [ "$force_image" = yes ]; then
-        echo "NOTE: configured vm image '$IMAGE_VM' is your own tag — never rebuilt here;"
-        echo "      update it yourself (docker build --build-arg RUNTIME_TYPE=vm -t '$IMAGE_VM' .)."
+        echo "NOTE: configured vm image '$MODE_IMAGE_VM' is your own tag — never rebuilt here;"
+        echo "      update it yourself (docker build --build-arg RUNTIME_TYPE=vm -t '$MODE_IMAGE_VM' .)."
     else
-        echo "NOTE: using configured vm image '$IMAGE_VM' (image build skipped)."
+        echo "NOTE: using configured vm image '$MODE_IMAGE_VM' (image build skipped)."
     fi
     # Toolchain probe (2026-09-14): the base-disk pipeline runs INSIDE the
     # configured image (its bash/tar/qemu-img/mkfs.ext4, as root in a
     # container). Probe with /bin/sh so a missing bash is reported
     # precisely, and fail BEFORE the export pipeline — never with a lie
     # like "produced no artifacts".
-    if ! docker run --rm --entrypoint /bin/sh "$IMAGE_VM" -c \
+    if ! docker run --rm --entrypoint /bin/sh "$MODE_IMAGE_VM" -c \
             'command -v bash && command -v qemu-img && command -v mkfs.ext4 && command -v tar && ls /boot/vmlinuz-*' >/dev/null 2>&1; then
         echo "ERROR: configured vm image '$IMAGE_VM' lacks the base-disk toolchain." >&2
         echo "       It must carry bash, qemu-utils, e2fsprogs and tar, and a kernel in /boot/vmlinuz-*." >&2
@@ -510,6 +612,30 @@ gc_vm_bases() {
     echo "==> GC: removed $removed unreferenced base image(s); kept $kept (referenced by sessions or newest)."
 }
 
+# ── Mode selection + one (runtime, mode) build ─────────────────────────────
+BUILD_MODES=()
+if [ "$BUILD_SLIM" = true ]; then BUILD_MODES=(slim)
+elif [ "$BUILD_FULL" = true ]; then BUILD_MODES=(full)
+fi
+
+# Whether the caller named the mode explicitly (`--slim` / `--full`): an
+# explicit mode always builds the image, a bare `./build vm` keeps the
+# documented reuse path.
+MODE_EXPLICIT=no
+[ ${#BUILD_MODES[@]} -gt 0 ] && MODE_EXPLICIT=yes
+
+build_one() {   # <runtime> <full|slim> [rebuild]
+    local rt="$1" mode="$2" rebuild="${3:-}"
+    case "$rt" in
+        # Always three positional args, with a sentinel for "no rebuild":
+        # `build_vm ${rebuild:+rebuild} "$mode" "$explicit"` shifted the
+        # explicit flag into $2 whenever rebuild was empty (measured: `--slim
+        # vm` silently reused the image for exactly that reason).
+        vm) build_vm "${rebuild:-no-rebuild}" "$mode" "$MODE_EXPLICIT" ;;
+        *)  build_docker_image "$rt" "$mode" ;;
+    esac
+}
+
 # ── Dispatch ───────────────────────────────────────────────────────────────
 if [ "$CHECK" = true ]; then
     check_vm_prereqs || exit 1
@@ -517,14 +643,12 @@ if [ "$CHECK" = true ]; then
 fi
 
 case "$RUNTIME" in
-    sysbox)
-        build_docker_image sysbox
-        ;;
-    docker)
-        build_docker_image docker
-        ;;
-    vm)
-        build_vm
+    sysbox|docker|vm)
+        # A single runtime keeps the historical default: the full image.
+        if [ ${#BUILD_MODES[@]} -eq 0 ]; then BUILD_MODES=(full); fi
+        for _m in "${BUILD_MODES[@]}"; do
+            build_one "$RUNTIME" "$_m" || exit 1
+        done
         ;;
     relay)
         build_relay
@@ -533,14 +657,23 @@ case "$RUNTIME" in
         # `all` is the "this machine is ready" command: every image, including
         # the netwall relay, and the vm image is REBUILT rather than reused —
         # a base disk is only as new as the rootfs it was built from, and the
-        # other three builds here are full --no-cache builds. `./build vm`
-        # alone keeps the cheap path (reuse an existing image).
+        # other builds here are full --no-cache builds. `./build vm` alone
+        # keeps the cheap path (reuse an existing image).
+        #
+        # Modes: no flag builds BOTH, slim first for every runtime (the full
+        # image is FROM the slim image), so `./build all` is still the one
+        # command that makes a machine ready for either mode.
+        if [ ${#BUILD_MODES[@]} -eq 0 ]; then BUILD_MODES=(slim full); fi
         failed=0
         if command -v docker &>/dev/null; then
-            build_docker_image sysbox || (( ++failed ))
-            build_docker_image docker || (( ++failed ))
+            for _m in "${BUILD_MODES[@]}"; do
+                echo ""
+                echo "==> mode: $_m"
+                build_one sysbox "$_m" || (( ++failed ))
+                build_one docker "$_m" || (( ++failed ))
+                build_one vm "$_m" rebuild || (( ++failed ))
+            done
             build_relay || (( ++failed ))
-            build_vm rebuild || (( ++failed ))
         else
             echo "ERROR: docker not found — cannot build any images." >&2
             exit 1

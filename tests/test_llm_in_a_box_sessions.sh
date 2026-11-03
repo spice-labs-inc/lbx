@@ -1199,6 +1199,13 @@ lg_fake() {
     local tag="$1"
     mkdir -p "$LLG/bin-$tag" "$LLG/home-$tag" "$LLG/state-$tag"
     ln -sf "$SCRIPT_DIR/fake-docker.sh" "$LLG/bin-$tag/docker"
+    # The launcher refuses a sysbox create when the host has no fusermount3.
+    # That is a HOST fact, and a check about "which arguments did the launch
+    # pass" must not depend on it: provide the helper in the fake PATH so the
+    # create path is reachable on every machine (measured: a host without
+    # sysbox has no fusermount3, and T36 could never reach docker run).
+    printf '#!/bin/sh\nexit 0\n' >"$LLG/bin-$tag/fusermount3"
+    chmod +x "$LLG/bin-$tag/fusermount3"
     : > "$LLG/log-$tag"
     : > "$LLG/exist-$tag"
     : > "$LLG/table-$tag"

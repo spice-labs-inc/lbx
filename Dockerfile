@@ -1,17 +1,44 @@
 ## ---------------------------------------------------------------------------
 ## llm-in-a-box — isolated, batteries-included dev container for
-## running Claude Code in --dangerously-skip-permissions mode.
+## running coding agents in --dangerously-skip-permissions mode.
 ##
 ## Supports multiple isolation runtimes via RUNTIME_TYPE build arg:
 ##   sysbox  — Sysbox (user namespaces + syscall virtualization)
 ##   docker  — Plain Docker (--privileged DinD, for Docker/Rancher Desktop)
+##   vm      — KVM virtual machine rootfs
 ##
-## Build:  docker build --build-arg RUNTIME_TYPE=sysbox -t llm-in-a-box:sysbox .
+## Two image modes, one Dockerfile, one set of provisioning steps:
+##
+##   slim  (llm-in-a-box:<runtime>-slim)   OS, box user, entrypoint, docker,
+##                                         node, gh, CLI tools, and the
+##                                         provisioning steps themselves.
+##                                         lbx-setup installs capabilities on
+##                                         demand, from inside the box.
+##   full  (llm-in-a-box:<runtime>)        FROM the slim image + every
+##                                         provisioning step run at build time.
+##                                         Identical to what shipped before.
+##
+## The full image is built FROM the slim image (not from ubuntu), so "the
+## scripts are the same scripts" is structural, and both modes cost one
+## toolchain download: with --no-cache there is no layer cache to share, but a
+## parent image is not a cache.
+##
+## Build (./build does this for you):
+##   docker build --build-arg RUNTIME_TYPE=sysbox --target slim -t llm-in-a-box:sysbox-slim .
+##   docker build --build-arg RUNTIME_TYPE=sysbox --target full \
+##       --build-arg SLIM_IMAGE=llm-in-a-box:sysbox-slim -t llm-in-a-box:sysbox .
 ## ---------------------------------------------------------------------------
-FROM ubuntu:24.04
+# Global ARGs: both are needed before the first FROM so the `full` stage's
+# `FROM ${SLIM_IMAGE}` resolves (BuildKit validates every stage's base, even
+# for `--target slim`).
+ARG RUNTIME_TYPE=sysbox
+ARG SLIM_IMAGE=llm-in-a-box:sysbox-slim
+
+FROM ubuntu:24.04 AS slim
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG RUNTIME_TYPE=sysbox
+# Re-declare so the value is in scope for RUN in this stage.
+ARG RUNTIME_TYPE
 
 # ── Validate RUNTIME_TYPE ────────────────────────────────────────────────────
 RUN case "$RUNTIME_TYPE" in \
@@ -26,32 +53,39 @@ RUN echo 'Acquire::ForceIPv4 "true";' > /etc/apt/apt.conf.d/99force-ipv4 \
     && sed -i 's|http://archive.ubuntu.com|http://ubuntu.osuosl.org|g' \
         /etc/apt/sources.list.d/ubuntu.sources
 
-# ── Locale ───────────────────────────────────────────────────────────────────
-RUN apt-get update && apt-get install -y locales \
-    && locale-gen en_US.UTF-8 \
-    && rm -rf /var/lib/apt/lists/*
+# ── Locale + slim system packages (one apt run) ─────────────────────────────
+# One apt layer, not two: every `apt-get update` here is ~3 s of index fetching
+# and a separate layer, and a slim image is built often. `--no-install-recommends`
+# is deliberate — the Recommends of this set are desktop/suggested extras
+# (documentation, extra fonts, python3-dev) that a box does not need, and they
+# are a third of the download.
+#
+# Contents: a shell, git, an editor that is always there, the CLI tools agents
+# reach for, a C toolchain (npm native modules and anything you compile by
+# hand), python3 (most CLIs are python), and `dialog` for lbx-setup. Language
+# toolchains, Emacs, Ansible and the agents are provisioning steps
+# (docker/provision.d/), installed on demand in a slim box.
 ENV LANG=en_US.UTF-8
 ENV LC_ALL=en_US.UTF-8
-
-# ── Core system packages ────────────────────────────────────────────────────
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    locales \
     # essentials
     git curl wget unzip zip sudo ca-certificates gnupg lsb-release \
     software-properties-common apt-transport-https \
-    # build tools
-    build-essential cmake pkg-config libssl-dev protobuf-compiler \
-    # CLI tools Claude Code reaches for
+    # C toolchain (npm native modules, hand-built tools)
+    build-essential pkg-config libssl-dev \
+    # CLI tools agents reach for
     ripgrep fd-find bat tree htop jq tmux \
     # editors (vim provides /usr/bin/vi via alternatives)
-    vim emacs-nox \
-    # Python
-    python3 python3-pip python3-venv python3-full \
-    # Java
-    openjdk-21-jdk maven \
-    # Ansible
-    ansible \
+    vim \
+    # python3 interpreter only; pip/venv/ansible are a provisioning step
+    python3 \
+    # lbx-setup's checklist UI, and the terminal definitions it needs on
+    # terminals beyond xterm/vt100 (kitty, wezterm, foot, alacritty).
+    dialog ncurses-term \
     # gosu for entrypoint user switching
     gosu \
+    && locale-gen en_US.UTF-8 \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Symlinks for Ubuntu-renamed tools ───────────────────────────────────────
@@ -64,27 +98,6 @@ RUN ARCH=$(dpkg --print-architecture) \
         -o /usr/local/bin/yq \
     && chmod +x /usr/local/bin/yq
 
-# ── Gradle ──────────────────────────────────────────────────────────────────
-ARG GRADLE_VERSION=9.7.1
-RUN curl -fsSL "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" \
-        -o /tmp/gradle.zip \
-    && unzip -q /tmp/gradle.zip -d /opt \
-    && ln -s "/opt/gradle-${GRADLE_VERSION}" /opt/gradle \
-    && rm /tmp/gradle.zip
-ENV PATH="/opt/gradle/bin:${PATH}"
-
-# ── SBT ─────────────────────────────────────────────────────────────────────
-RUN curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x2EE0EA64E40A89B84B2DF73499E82A75642AC823" \
-        | gpg --dearmor -o /etc/apt/trusted.gpg.d/sbt.gpg \
-    && echo "deb https://repo.scala-sbt.org/scalasbt/debian all main" \
-        > /etc/apt/sources.list.d/sbt.list \
-    && apt-get update && apt-get install -y sbt \
-    && rm -rf /var/lib/apt/lists/*
-
-# ── Node.js 24 LTS (via NodeSource) ────────────────────────────────────────
-RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
-    && apt-get install -y nodejs \
-    && rm -rf /var/lib/apt/lists/*
 
 # ── Container engine: Docker CE (inner DinD via the host runtime's isolation)
 #
@@ -102,6 +115,14 @@ ARG SYSBOX_DOCKER_ROOTLESS_VERSION=5:27.5.1-1~ubuntu.24.04~noble
 ARG SYSBOX_CONTAINERD_VERSION=1.7.28-1~ubuntu.24.04~noble
 ARG SYSBOX_BUILDX_VERSION=0.20.0-1~ubuntu.24.04~noble
 ARG SYSBOX_COMPOSE_VERSION=2.32.4-1~ubuntu.24.04~noble
+# ── Node.js 24, Docker CE and gh: one apt layer ─────────────────────────────
+# All three need a third-party repository, and each repository otherwise costs
+# its own `apt-get update` (~3 s of index fetching) and its own layer commit.
+# Registering every repository first and running a single update+install keeps
+# the slim build near its download time, which is the whole point of it.
+#
+# Node is in the slim image because the agents (a provisioning step) need it and
+# lbx-setup shells out to npm; gh is core to agent work (PRs, issues).
 RUN install -m 0755 -d /etc/apt/keyrings \
     && curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
         -o /etc/apt/keyrings/docker.asc \
@@ -111,9 +132,18 @@ RUN install -m 0755 -d /etc/apt/keyrings \
         https://download.docker.com/linux/ubuntu \
         $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
         > /etc/apt/sources.list.d/docker.list \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) \
+        signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] \
+        https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list \
+    && curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
     && if [ "$RUNTIME_TYPE" = "sysbox" ]; then \
         apt-get update \
-        && apt-get install -y --allow-downgrades \
+        && apt-get install -y --no-install-recommends --allow-downgrades \
+            nodejs gh \
             docker-ce="${SYSBOX_DOCKER_CE_VERSION}" \
             docker-ce-cli="${SYSBOX_DOCKER_CLI_VERSION}" \
             docker-ce-rootless-extras="${SYSBOX_DOCKER_ROOTLESS_VERSION}" \
@@ -124,7 +154,8 @@ RUN install -m 0755 -d /etc/apt/keyrings \
             docker-ce docker-ce-cli docker-ce-rootless-extras \
             docker-buildx-plugin docker-compose-plugin containerd.io; \
     else \
-        apt-get update && apt-get install -y \
+        apt-get update && apt-get install -y --no-install-recommends \
+            nodejs gh \
             docker-ce docker-ce-cli containerd.io \
             docker-buildx-plugin docker-compose-plugin; \
     fi \
@@ -187,20 +218,6 @@ RUN if [ "$RUNTIME_TYPE" = "sysbox" ]; then \
 COPY docker/vm-net-attach.sh /usr/local/bin/vm-net-attach
 RUN chmod +x /usr/local/bin/vm-net-attach
 
-# ── GitHub CLI (gh) ─────────────────────────────────────────────────────────
-# Installed on all runtime variants so GH_TOKEN forwarded by lbx
-# (when set on the host) is immediately usable inside the container.
-RUN install -m 0755 -d /etc/apt/keyrings \
-    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-        -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
-    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
-    && echo "deb [arch=$(dpkg --print-architecture) \
-        signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] \
-        https://cli.github.com/packages stable main" \
-        > /etc/apt/sources.list.d/github-cli.list \
-    && apt-get update && apt-get install -y gh \
-    && rm -rf /var/lib/apt/lists/*
-
 # ── Default user (UID/GID adjusted at runtime by entrypoint) ───────────────
 # Ubuntu 24.04 may already have a user/group at UID/GID 1000 (e.g. "ubuntu").
 # Remove any existing occupants, then create our user cleanly.
@@ -216,143 +233,36 @@ RUN existing_user=$(getent passwd 1000 | cut -d: -f1) \
 # Add user to docker group
 RUN usermod -aG docker agent
 
-# ── Rust toolchain (as the agent user) ─────────────────────────────────────────
-USER agent
-ENV RUSTUP_HOME=/home/agent/.rustup
-ENV CARGO_HOME=/home/agent/.cargo
-ENV PATH="/home/agent/.cargo/bin:${PATH}"
-
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --default-toolchain stable \
-    && rustup target add wasm32-unknown-unknown \
-    && rustup component add rustfmt clippy rust-analyzer \
-    && cargo install \
-        wasm-pack \
-        cargo-watch \
-        cargo-edit \
-        cargo-expand \
-        cargo-audit \
-        cargo-outdated \
-        cargo-deny \
-        sccache \
-    && rustup component remove rust-docs 2>/dev/null || true \
-    && rm -rf "$RUSTUP_HOME/downloads" "$RUSTUP_HOME/tmp" "$CARGO_HOME/registry" "$CARGO_HOME/git"
-
-# ── Bun runtime (required by OMP) ───────────────────────────────────────────
-# @oh-my-pi/pi-coding-agent (the `omp` binary) ships a Bun-only bundle:
-# dist/cli.js has shebang `#!/usr/bin/env bun` and package.json declares an
-# engines.bun floor with no Node fallback. Without Bun, `omp` cannot execute at
-# all — this is a hard runtime dependency, not an optional one.
-#
-# THE PIN MUST SATISFY omp'S CURRENT FLOOR, and the floor moves with upstream
-# because the agent packages are installed unpinned. It was >=1.3.14 (Bun
-# 1.4.0 here), and on 2026-10-25 omp 18.14.0 raised it to >=1.4.4: the pinned
-# 1.4.0 made `omp --version` fail and took down EVERY image build (sysbox,
-# docker and vm) at step 25/47 with "Bun runtime must be >= 1.4.4". Check the
-# floor when this pin ages, and bump it when it does:
-#   npm view @oh-my-pi/pi-coding-agent engines.bun
-ARG BUN_VERSION=1.4.4
-ENV BUN_INSTALL=/home/agent/.bun
-ENV PATH="${BUN_INSTALL}/bin:${PATH}"
-RUN curl -fsSL https://bun.sh/install | bash -s -- "bun-v${BUN_VERSION}"
-# The ENV above is docker-runtime-only and is LOST in the extracted vm
-# rootfs; without a system-PATH symlink, `omp` (shebang
-# `#!/usr/bin/env bun`) fails in the vm guest's non-interactive ssh
-# sessions. Bake bun onto the system
-# PATH like the aft symlink below. (USER is agent at this point —
-# /usr/local/bin needs root.)
-USER root
-RUN ln -s /home/agent/.bun/bin/bun /usr/local/bin/bun \
-    && ln -s /home/agent/.bun/bin/bunx /usr/local/bin/bunx
-USER agent
-
-# ── Claude Code + Pi + OpenCode + OMP (global npm install, as root) ────────────
-# Unpinned on purpose: images pick up the latest at rebuild time.
-# Pi is @earendil-works/pi-coding-agent — the @mariozechner scope was
-# renamed at 0.74.0 and is deprecated.
-USER root
-RUN npm install -g \
-        @anthropic-ai/claude-code \
-        @earendil-works/pi-coding-agent \
-        opencode-ai \
-        @oh-my-pi/pi-coding-agent
-
-# ── Build-time smoke test: fail the build if Bun/OMP is broken ─────────────
-# (a broken `omp` install must not pass silently as done)
-# The env -i run resolves bun ONLY via the system-PATH symlink — the exact
-# context the vm guest's ssh-exec probes use (2026-09-02).
-# The trailing message matters: without it the operator sees a wall of build
-# log and one buried upstream line ("Bun runtime must be >= 1.4.4 …"), which
-# is how the 2026-10-25 breakage read. It names the pin and the command that
-# reports the floor.
-RUN bun --version && omp --version \
-    && env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin omp --version \
-    || { echo "ERROR: the Bun/OMP smoke test above failed. If it says the Bun runtime is too old, the pinned BUN_VERSION is below omp's engines.bun floor: check 'npm view @oh-my-pi/pi-coding-agent engines.bun' and raise the pin. (2026-10-25: omp 18.14.0 raised the floor to >=1.4.4 and the pinned 1.4.0 broke every image build.)" >&2; exit 1; }
-
-# ── umans.ai CLI (managed LLM endpoint for Claude Code) ──────────────────
-RUN curl -fsSL https://api.code.umans.ai/cli/install.sh | bash \
-    && chmod a+rx /usr/local/bin/umans
-
-# ── Pi plugins: umans provider, AFT, web-access ───────────────────────────
-# `pi install npm:<pkg>` registers the spec in ~/.pi/agent/settings.json and
-# runs `npm install -g <pkg>`; unpinned so `pi update` refreshes them.
-# HOME is the agent profile so settings land there; the npm cache is kept
-# out of /home/agent (a root-owned cache would break the agent user's npm).
-# `pi install` (pi >= 0.74) installs npm packages into the pi agent tree
-# (~/.pi/agent/npm/node_modules), NOT the npm global tree — the symlink
-# below points at that tree. aft-pi's optional platform dependency
-# (@cortexkit/aft-linux-x64) ships the `aft` binary, but npm only links bins
-# of TOP-LEVEL installed packages, not of their dependencies — so the aft
-# bin is symlinked explicitly. The smoke test below proves it executes (no
-# first-run download at session time).
-# pi-web-access (web search,
-# URL fetch, repo clone, PDF/YouTube/video extraction). It is a plain pi
-# extension with no extra runtime deps (verified against npm).
-USER root
-ENV HOME=/home/agent
-RUN NPM_CONFIG_CACHE=/root/.npm pi install npm:pi-provider-umans \
-    && NPM_CONFIG_CACHE=/root/.npm pi install npm:@cortexkit/aft-pi \
-    && NPM_CONFIG_CACHE=/root/.npm pi install npm:pi-web-access \
-    && ln -sf /home/agent/.pi/agent/npm/node_modules/@cortexkit/aft-linux-x64/bin/aft /usr/local/bin/aft \
-    && rm -rf /root/.npm
-
-# ── Magic Context default config — historian on the cheapest
-# Umans model; per-user Umans auth at runtime (/login umans | UMANS_API_KEY) ─
-# /home/agent/.config must be agent-owned: COPY creates missing parent
-# dirs as root, which would leave the agent user unable to create its own
-# agent config dirs (e.g. opencode's ~/.config/opencode — caught by
-# tests/verify-no-thinking-config.sh).
-RUN mkdir -p /home/agent/.config/cortexkit \
-    && chown agent:agent /home/agent/.config /home/agent/.config/cortexkit
-COPY --chown=agent:agent docker/magic-context.jsonc /home/agent/.config/cortexkit/magic-context.jsonc
-RUN chown -R agent:agent /home/agent/.pi
-
-# ── Build-time smoke test: fail the build if pi or the plugins are broken ──
-# (no silent "looks done" states)
-RUN pi --version && pi list && aft --version
-
-# -- Credential purge ------------------------------
-# Never ship a pi credential file: auth is per-user at runtime (/login umans
-# | UMANS_API_KEY). A build env exporting UMANS_API_KEY would leak a key into
-# the image via pi init; a stale key then shadows the user's login and breaks
-# model discovery (observed 2026-09-06). Removes both the agent profile and
-# the root profile; runs AFTER the smoke test so the last credential-writing
-# build step is always followed by the purge. test ! -e fails the build if a
-# credential would still ship. Runtime gate: tests/verify-pi-plugins.sh
-# "image ships no key-bearing pi auth.json".
-RUN rm -f /home/agent/.pi/agent/auth.json /root/.pi/agent/auth.json \
-    && test ! -e /home/agent/.pi/agent/auth.json \
-    && test ! -e /root/.pi/agent/auth.json \
-    && chown -R agent:agent /home/agent/.pi
-
-# ── Claude Code settings: deny mutating git operations ─────────────────────
-USER agent
-RUN mkdir -p /home/agent/.claude
+# ── Box identity: agent settings and the prompt's runtime tag ───────────────
+# These belong to the box, not to a toolchain: a slim box that installs Claude
+# Code later must still get the deny rules, and the prompt shows the runtime
+# in every mode.
+RUN mkdir -p /home/agent/.claude /home/agent/.config/cortexkit \
+    && chown agent:agent /home/agent/.claude /home/agent/.config \
+        /home/agent/.config/cortexkit
 COPY --chown=agent:agent claude-settings.json /home/agent/.claude/settings.json
-
-# ── Shell prompt showing runtime type ───────────────────────────────────────
+COPY --chown=agent:agent docker/magic-context.jsonc \
+    /home/agent/.config/cortexkit/magic-context.jsonc
 RUN echo "PS1='[${RUNTIME_TYPE}] \\u@\\h:\\w\\$ '" >> /home/agent/.bashrc
 
+# ── Provisioning steps (the definition of "installed") ─────────────────────
+# The fat image runs them at build time; a slim box runs them with lbx-setup.
+# Shipping them in BOTH modes is what keeps the two from drifting.
+COPY docker/provision-lib.sh /opt/llm-in-a-box/provision-lib.sh
+COPY docker/provision.d/ /opt/llm-in-a-box/provision.d/
+COPY docker/optional.d/ /opt/llm-in-a-box/optional.d/
+# The vm-only tier is copied to a scratch path and kept ONLY for RUNTIME_TYPE=vm:
+# a docker/sysbox slim box must not even list a GUI step it could never run.
+COPY docker/optional-vm.d/ /tmp/optional-vm.d/
+COPY docker/lbx-setup /usr/local/bin/lbx-setup
+RUN chmod +x /usr/local/bin/lbx-setup \
+    && find /opt/llm-in-a-box /tmp/optional-vm.d -name '*.sh' -exec chmod +x {} + \
+    && if [ "$RUNTIME_TYPE" = "vm" ]; then \
+        mv /tmp/optional-vm.d /opt/llm-in-a-box/optional-vm.d; \
+    else \
+        rm -rf /tmp/optional-vm.d; \
+    fi \
+    && install -d -o agent -g agent /home/agent/.lbx
 
 # ── VM runtime variant (RUNTIME_TYPE=vm) ─────────────────────────────────────
 # The exported rootfs of this variant boots as a KVM VM: systemd is PID 1
@@ -368,18 +278,23 @@ RUN echo "PS1='[${RUNTIME_TYPE}] \\u@\\h:\\w\\$ '" >> /home/agent/.bashrc
 # ssh.socket) that systemd breaks by skipping the setup service. The
 # package enables ssh.socket by default, so disable it and keep the
 # multi-user ssh.service enable.
-# NOTE (2026-09-01): this RUN sits at the END of the Dockerfile (after the
-# toolchain/agent layers) on purpose — when it was earlier in the file, the
+# NOTE (2026-09-01): this RUN sits at the END of the slim stage (after the
+# shared layers) on purpose — when it was earlier in the file, the
 # RUNTIME_TYPE=vm build invalidated every later layer (rust, npm, pi
 # plugins), forcing full recompiles and re-downloads that also exhausted
 # the disk on space-constrained build hosts. Same content, cache-friendly
-# order: the docker and vm variants now share all toolchain/agent layers.
+# order. In the split design the provisioning steps live in the `full`
+# stage (FROM this image), so this layer can no longer invalidate them.
 USER root
 RUN if [ "$RUNTIME_TYPE" = "vm" ]; then \
-        apt-get update && apt-get install -y \
+        apt-get update && apt-get install -y --no-install-recommends \
             openssh-server linux-image-virtual initramfs-tools \
             iptables iproute2 qemu-utils \
             iputils-ping dnsutils telnet netcat-openbsd traceroute \
+            # xauth is an openssh-server RECOMMEND, which --no-install-recommends
+            # drops: without it `ssh -X` has no cookie helper and the GUI
+            # transport silently cannot forward a display.
+            xauth \
         && rm -f /etc/systemd/system/sockets.target.wants/ssh.socket \
                /lib/systemd/system/sockets.target.wants/ssh.socket \
         && ln -sf /lib/systemd/system/ssh.service /etc/systemd/system/multi-user.target.wants/ssh.service \
@@ -409,6 +324,23 @@ RUN chmod +x /entrypoint.sh /usr/local/bin/update-claude-code /usr/local/sbin/vm
 
 # ── Store runtime type for entrypoint ───────────────────────────────────────
 ENV LBX_RUNTIME_TYPE=${RUNTIME_TYPE} LLMBOX_RUNTIME_TYPE=${RUNTIME_TYPE}
+# ... and on disk, because the vm runtime boots this image's rootfs as a guest:
+# an exported rootfs carries no container ENV, so every ssh session in a vm box
+# saw LBX_RUNTIME_TYPE empty. Provisioning steps read the file instead.
+RUN install -d /etc/llm-in-a-box && printf '%s\n' "${RUNTIME_TYPE}" > /etc/llm-in-a-box/runtime
+
+# ── Box user's toolchain home ──────────────────────────────────────────────
+# Kept from the pre-split image so a bare `docker exec <box> bash` finds the
+# same toolchains: HOME is the box user's, and the per-user toolchain dirs are
+# on PATH. In a slim box these paths exist only after the matching lbx-setup
+# step — the provisioning steps also symlink their binaries into
+# /usr/local/bin, because the vm guest loses this ENV in non-interactive ssh
+# sessions (the same reason bun and aft are symlinked).
+ENV HOME=/home/agent \
+    RUSTUP_HOME=/home/agent/.rustup \
+    CARGO_HOME=/home/agent/.cargo \
+    BUN_INSTALL=/home/agent/.bun
+ENV PATH="/home/agent/.cargo/bin:/home/agent/.bun/bin:${PATH}"
 
 # ── Create /data mount point ───────────────────────────────────────────────
 RUN mkdir -p /data && chown agent:agent /data
@@ -416,3 +348,36 @@ RUN mkdir -p /data && chown agent:agent /data
 WORKDIR /data
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["sleep", "infinity"]
+
+## ---------------------------------------------------------------------------
+## full — the image that ships today: slim + every provisioning step, run in
+## order at build time. Nothing about its contents should differ from the
+## pre-split image except that the steps now live in provision.d/.
+## ---------------------------------------------------------------------------
+FROM ${SLIM_IMAGE} AS full
+
+ARG RUNTIME_TYPE=sysbox
+
+# Runs as root (the slim stage ends as USER root). Each step is idempotent and
+# carries its own smoke test, so a broken upstream release fails the build here
+# exactly as loudly as it did before the split.
+RUN for step in /opt/llm-in-a-box/provision.d/*.sh; do \
+        echo "==> provision: $(basename "$step")"; \
+        bash "$step"; \
+    done
+
+# A full image is the preprovisioned set: it must not be able to offer an
+# optional tier at all ("never baked into a full build").
+RUN rm -rf /opt/llm-in-a-box/optional.d /opt/llm-in-a-box/optional-vm.d
+
+# Ownership is ASSERTED, not repaired. Every step installs as the box user
+# (as_box) or as root into /usr/local, so /home/agent is already box-owned —
+# measured on a full build, `chown -R /home/agent` took 484 s and changed
+# nothing. This fails the build the moment a step starts writing as root, and
+# costs milliseconds.
+RUN test -f /home/agent/.pi/agent/settings.json \
+    && test -z "$(find /home/agent ! -user agent -print -quit)"
+
+# The fat image's build-time gate, kept as one last assertion.
+RUN pi --version && omp --version && opencode --version && claude --version \
+    && aft --version && pi list

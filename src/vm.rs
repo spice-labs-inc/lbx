@@ -4,6 +4,7 @@
 //! suites' fake qemu (no KVM group on the spike host).
 
 use crate::config::Resolved;
+use crate::mode::Provision;
 use crate::session::{vm_live_pid_for, vm_sessions_dir};
 use crate::util::{err, out, path_str, realpath_m, which};
 use std::os::unix::fs::MetadataExt;
@@ -26,6 +27,51 @@ pub fn latest_base_dir(cfg: &Resolved) -> Option<PathBuf> {
     (d.join("base.qcow2").is_file() && d.join("vmlinuz").is_file()).then_some(d)
 }
 
+/// The newest base built for a mode (`slim` = a base stamped `core`).
+///
+/// Base disks are immutable and stamped (`bases/<ts>/provision`, written by
+/// ./build), so a mode picks its own base instead of whichever happens to be
+/// newest. Bases from before the stamp carry no file and are `full` — that
+/// keeps an existing machine working unchanged. `latest` is the last-resort
+/// for `full` only.
+pub fn base_dir_for(cfg: &Resolved, mode: &str) -> Option<PathBuf> {
+    let bases = cfg.state_dir.join("bases");
+    let want = if mode == "slim" { "core" } else { "full" };
+    let mut best: Option<(String, PathBuf)> = None;
+    if let Ok(rd) = std::fs::read_dir(&bases) {
+        for e in rd.filter_map(Result::ok) {
+            let p = e.path();
+            if !p.is_dir() || p.is_symlink() {
+                continue;
+            }
+            if !(p.join("base.qcow2").is_file() && p.join("vmlinuz").is_file()) {
+                continue;
+            }
+            let stamp = std::fs::read_to_string(p.join("provision")).unwrap_or_default();
+            let this = if stamp.trim() == "core" {
+                "core"
+            } else {
+                "full"
+            };
+            if this != want {
+                continue;
+            }
+            let name = e.file_name().to_string_lossy().into_owned();
+            if best.as_ref().is_none_or(|(b, _)| name > *b) {
+                best = Some((name, p));
+            }
+        }
+    }
+    if let Some((_, p)) = best {
+        return Some(p);
+    }
+    // Pre-stamp bases (no `provision` file) are full ones.
+    if want == "full" {
+        return latest_base_dir(cfg);
+    }
+    None
+}
+
 /// The session's recorded origin, else the launch directory.
 pub fn project_dir(cfg: &Resolved, session: &str) -> PathBuf {
     if !session.is_empty()
@@ -38,7 +84,11 @@ pub fn project_dir(cfg: &Resolved, session: &str) -> PathBuf {
 }
 
 /// session record > latest > legacy flat layout. `Err` = error printed.
-pub fn resolve_base(cfg: &Resolved, session: &str) -> Result<Base, Printed> {
+///
+/// `mode` is `full` or `slim`: it only decides which base a NEW session gets
+/// (an existing session is pinned to the base it recorded, whatever the mode
+/// of the launch that created it).
+pub fn resolve_base(cfg: &Resolved, session: &str, mode: &str) -> Result<Base, Printed> {
     let bases = cfg.state_dir.join("bases");
     let rec = std::fs::read_to_string(vm_sessions_dir(cfg).join(session).join("base"))
         .map(|s| s.trim_end_matches('\n').to_string())
@@ -77,12 +127,19 @@ pub fn resolve_base(cfg: &Resolved, session: &str) -> Result<Base, Printed> {
         err("        overlay onto a different base; the session cannot be relaunched.)");
         return Err(Printed);
     }
-    if let Some(d) = latest_base_dir(cfg) {
+    if let Some(d) = base_dir_for(cfg, mode) {
         return Ok(Base {
             base: d.join("base.qcow2"),
             vmlinuz: d.join("vmlinuz"),
             initrd: d.join("initrd.img"),
         });
+    }
+    if mode == "slim" {
+        err("ERROR: no slim vm base disk found in the state directory.");
+        err("       Base disks are per mode: the slim image needs its own base.");
+        err("       Build one:  ./build --slim vm");
+        err("       (or launch the preprovisioned image with --full)");
+        return Err(Printed);
     }
     Ok(Base {
         base: cfg.state_dir.join("base.qcow2"),
@@ -170,8 +227,14 @@ fn image_repo_digest(image: &str) -> Option<String> {
 }
 
 /// The preflight. Exits 1 with guidance on failure; returns the base.
-pub fn preflight(cfg: &Resolved, session: &str, script_dir: &Path) -> Base {
-    let Ok(b) = resolve_base(cfg, session) else {
+pub fn preflight(
+    cfg: &Resolved,
+    session: &str,
+    script_dir: &Path,
+    image: &str,
+    mode: &str,
+) -> Base {
+    let Ok(b) = resolve_base(cfg, session, mode) else {
         std::process::exit(1);
     };
     if let Some(dir) = b.base.parent()
@@ -183,7 +246,10 @@ pub fn preflight(cfg: &Resolved, session: &str, script_dir: &Path) -> Base {
             .find_map(|l| l.strip_prefix("image-id "))
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        let current_id = image_content_id(&cfg.image_vm);
+        // Compare against the image THIS launch resolved (slim or full), not
+        // the configured full image: a slim base is built from `:vm-slim`, so
+        // checking it against `:vm` warned about every slim box.
+        let current_id = image_content_id(image);
         // Content identity decides when both sides are known (2026-10-24).
         // The build records the ref (the repo DIGEST when docker reports one)
         // and, since this change, the image id. Two things made the ref
@@ -204,21 +270,22 @@ pub fn preflight(cfg: &Resolved, session: &str, script_dir: &Path) -> Base {
                     "WARNING: session base was built from vm image '{recorded}', but the configured"
                 ));
                 err(&format!(
-                    "         vm image ('{}') is now '{current}' — the base is not what the",
-                    cfg.image_vm
+                    "         vm image ('{image}') is now '{current}' — the base is not what the"
                 ));
-                err("         configuration describes. Rebuild it:  ./build vm");
+                err(&format!(
+                    "         configuration describes. Rebuild it:  ./build {}vm",
+                    if mode == "slim" { "--slim " } else { "" }
+                ));
             }
             (Some(_), Some(_)) => {}
             _ => {
-                if !from.is_empty() && from != cfg.image_vm {
+                if !from.is_empty() && from != image {
                     let same = is_digest_ref(&from)
-                        && !is_digest_ref(&cfg.image_vm)
-                        && image_repo_digest(&cfg.image_vm).is_none_or(|d| d == from);
+                        && !is_digest_ref(image)
+                        && image_repo_digest(image).is_none_or(|d| d == from);
                     if !same {
                         err(&format!(
-                            "WARNING: session base was built from a different image ('{from}') than the currently configured vm image ('{}').",
-                            cfg.image_vm
+                            "WARNING: session base was built from a different image ('{from}') than the currently configured vm image ('{image}')."
                         ));
                     }
                 }
@@ -344,6 +411,33 @@ pub fn preflight(cfg: &Resolved, session: &str, script_dir: &Path) -> Base {
         out("[WARN] no ~/.ssh/*.pub found — the vm boots, but ssh attach needs one: ssh-keygen");
     } else {
         out("[PASS] ssh public key");
+    }
+    // A GUI app's declared transport is advisory here: a host without a
+    // display must still be able to log in (qm::attach degrades and explains).
+    if let Some(marker) = gui_cache(cfg, session) {
+        let transport = parse_gui_marker(&marker);
+        if transport != GuiTransport::None {
+            let x11 = crate::util::which("xauth").is_some()
+                && std::env::var_os("DISPLAY").is_some_and(|d| !d.is_empty());
+            let wayland = crate::util::which("waypipe").is_some()
+                && std::env::var_os("WAYLAND_DISPLAY").is_some_and(|d| !d.is_empty());
+            match transport {
+                GuiTransport::X11 | GuiTransport::X11Trusted if x11 => {
+                    out("[PASS] display forwarding (xauth + $DISPLAY)");
+                }
+                GuiTransport::Wayland if wayland => {
+                    out("[PASS] display forwarding (waypipe + $WAYLAND_DISPLAY)");
+                }
+                _ => {
+                    out(&format!(
+                        "[WARN] this box has a GUI app ({}) and this host cannot forward a display",
+                        transport.label()
+                    ));
+                    out("       (ssh -X needs xauth and $DISPLAY; waypipe needs $WAYLAND_DISPLAY)");
+                    out("       The attach will still work, without a display.");
+                }
+            }
+        }
     }
     out("");
     if fail {
@@ -723,6 +817,13 @@ pub fn qemu_argv(p: &QemuPlan) -> Vec<String> {
 pub struct LaunchArgs<'a> {
     pub cfg: &'a Resolved,
     pub session: &'a str,
+    /// The image ref this launch resolved (full or slim).
+    pub image: &'a str,
+    /// `full` or `slim`: decides which base disk a new session gets.
+    pub provision: &'a str,
+    /// Host variables forwarded into the guest (written to ~/.lbx/env by
+    /// vm-setup.sh, sourced by the guest's .bashrc).
+    pub env_forward: &'a [(String, String)],
     pub host_user: &'a str,
     pub host_uid: u32,
     pub host_gid: u32,
@@ -744,7 +845,6 @@ pub struct Seed {
     pub host_uid: u32,
     pub host_gid: u32,
     pub hostname: String,
-    pub gh_token: Option<String>,
     pub ssh_pubkeys: Vec<String>,
     pub netwall: bool,
 }
@@ -756,9 +856,6 @@ pub fn seed_text(seed: &Seed) -> String {
     s.push_str(&format!("HOST_UID={}\n", seed.host_uid));
     s.push_str(&format!("HOST_GID={}\n", seed.host_gid));
     s.push_str(&format!("HOSTNAME={}\n", seed.hostname));
-    if let Some(t) = &seed.gh_token {
-        s.push_str(&format!("GH_TOKEN={}\n", shell_quote(t)));
-    }
     if !seed.ssh_pubkeys.is_empty() {
         let joined = seed.ssh_pubkeys.join("\n");
         s.push_str(&format!("SSH_PUBKEY={}\n", shell_quote(&joined)));
@@ -790,7 +887,6 @@ fn write_seed(l: &LaunchArgs, session_dir: &Path) -> Result<(), ()> {
         host_uid: l.host_uid,
         host_gid: l.host_gid,
         hostname: l.session.to_string(),
-        gh_token: std::env::var("GH_TOKEN").ok().filter(|t| !t.is_empty()),
         ssh_pubkeys: public_keys(),
         netwall: !l.net_policy.is_empty(),
     });
@@ -800,13 +896,210 @@ fn write_seed(l: &LaunchArgs, session_dir: &Path) -> Result<(), ()> {
     Ok(())
 }
 
+// ── GUI transport (vm only) ────────────────────────────────────────────────
+//
+// A GUI app installed *inside* a vm box writes `~/.lbx/gui` with the transport
+// it needs. The launcher reads it over the ssh channel it is about to use
+// anyway, and picks the transport for this attach — there is no flag to
+// remember and no qemu change: X11 and Wayland ride the ssh connection, so the
+// guest never gets a route to the host's display and the network wall is
+// untouched.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GuiTransport {
+    #[default]
+    None,
+    /// `ssh -X`: untrusted client, the default.
+    X11,
+    /// `ssh -Y`: trusted client, only when asked for explicitly.
+    X11Trusted,
+    /// `waypipe ssh`: Wayland over the same ssh channel.
+    Wayland,
+}
+
+impl GuiTransport {
+    pub fn label(self) -> &'static str {
+        match self {
+            GuiTransport::None => "none",
+            GuiTransport::X11 => "x11",
+            GuiTransport::X11Trusted => "x11-trusted",
+            GuiTransport::Wayland => "wayland",
+        }
+    }
+
+    fn ssh_flag(self) -> Option<&'static str> {
+        match self {
+            GuiTransport::X11 => Some("-X"),
+            GuiTransport::X11Trusted => Some("-Y"),
+            _ => None,
+        }
+    }
+}
+
+/// The transport a `~/.lbx/gui` marker file declares. Accepts `transport=x11`
+/// and a bare `x11`; anything unrecognised (or an absent file) is `None`.
+pub fn parse_gui_marker(text: &str) -> GuiTransport {
+    for raw in text.lines() {
+        let line = raw.trim();
+        let value = line.strip_prefix("transport=").unwrap_or(line);
+        match value.trim().trim_matches('"') {
+            "x11" => return GuiTransport::X11,
+            "x11-trusted" | "trusted" => return GuiTransport::X11Trusted,
+            "wayland" => return GuiTransport::Wayland,
+            _ => {}
+        }
+    }
+    GuiTransport::None
+}
+
+/// Whether this attach can honour what the marker (or `--x11`/`--wayland`)
+/// asked for. Pure so the rule is testable without a display or a waypipe.
+///
+/// `pref` is the CLI override: "" (auto), "none", "x11", "x11-trusted",
+/// "wayland". An explicit preference is honoured as-is except for "none";
+/// auto degrades silently (the caller prints one explanatory line) rather than
+/// failing an attach.
+pub fn choose_gui(
+    pref: &str,
+    marker: GuiTransport,
+    have_xauth: bool,
+    have_display: bool,
+    have_waypipe: bool,
+    have_wayland: bool,
+) -> GuiTransport {
+    match pref {
+        "none" => return GuiTransport::None,
+        "x11" => return GuiTransport::X11,
+        "x11-trusted" => return GuiTransport::X11Trusted,
+        "wayland" => return GuiTransport::Wayland,
+        _ => {}
+    }
+    let x11_ok = have_xauth && have_display;
+    match marker {
+        GuiTransport::None => GuiTransport::None,
+        GuiTransport::Wayland => {
+            if have_waypipe && have_wayland {
+                GuiTransport::Wayland
+            } else if x11_ok {
+                GuiTransport::X11
+            } else {
+                GuiTransport::None
+            }
+        }
+        other => {
+            if x11_ok {
+                other
+            } else {
+                GuiTransport::None
+            }
+        }
+    }
+}
+
+/// The ssh (or `waypipe ssh`) command line for one attach. Pure: every qemu,
+/// ssh and docker vector in this project is pinned by an exact test.
+pub fn attach_argv(port: &str, host_user: &str, gui: GuiTransport, cmd: &str) -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    if gui == GuiTransport::Wayland {
+        v.push("waypipe".into());
+    }
+    v.push("ssh".into());
+    v.push("-t".into());
+    if let Some(flag) = gui.ssh_flag() {
+        v.push(flag.into());
+    }
+    for a in [
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-p",
+        port,
+        &format!("{host_user}@127.0.0.1"),
+        cmd,
+    ] {
+        v.push(a.to_string());
+    }
+    v
+}
+
+/// What one probe answered: the GUI transport the box declares, and whether it
+/// still needs setting up (`lbx-setup` present, nothing recorded). Pure, so the
+/// contract is tested without a guest — the parse used to be three inline
+/// string operations nobody asserted.
+pub fn parse_probe(text: &str) -> (GuiTransport, bool) {
+    let (gui_part, state_part) = match text.split_once("__state__") {
+        Some((g, s)) => (g, s),
+        None => (text, ""),
+    };
+    let marker = parse_gui_marker(&gui_part.replace("__gui__", ""));
+    (marker, state_part.contains("provisioned=no"))
+}
+
+/// The cached marker for a session (`bases`-style state under the session dir).
+pub fn gui_cache(cfg: &Resolved, session: &str) -> Option<String> {
+    std::fs::read_to_string(vm_sessions_dir(cfg).join(session).join("gui")).ok()
+}
+
+/// One ssh exec before the interactive attach: refresh `~/.lbx/env` from this
+/// host (0600, so a rotated key replaces the old one and a removed variable
+/// disappears), and print the GUI marker if the box has one. Returns the
+/// marker text (empty when there is nothing or ssh failed).
+fn sync_and_probe_gui(port: &str, host_user: &str, env_forward: &[(String, String)]) -> String {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut payload = String::new();
+    for (name, value) in env_forward {
+        payload.push_str(&format!("export {name}={}\n", shell_quote(value)));
+    }
+    // One ssh exec also answers "does this box still need setting up?":
+    // lbx-setup present and no provisioning log.
+    let remote = "umask 077; mkdir -p .lbx; cat > .lbx/env; \
+        echo __gui__; cat .lbx/gui 2>/dev/null || true; \
+        echo __state__; \
+        if ! [ -x /usr/local/bin/lbx-setup ]; then echo provisioned=na; \
+        elif [ -s .lbx/provisioned.log ]; then echo provisioned=yes; \
+        else echo provisioned=no; fi";
+    let mut child = match Command::new("ssh")
+        .args([
+            "-T",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "ConnectTimeout=10",
+            "-p",
+            port,
+            &format!("{host_user}@127.0.0.1"),
+            remote,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return String::new(),
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(payload.as_bytes());
+    }
+    match child.wait_with_output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        _ => String::new(),
+    }
+}
+
 /// Boot the session. Exits 1 on any failure.
 pub fn launch(l: &LaunchArgs) {
     let cfg = l.cfg;
     let session = l.session;
     let session_dir = vm_sessions_dir(cfg).join(session);
     let _ = std::fs::create_dir_all(&session_dir);
-    let Ok(b) = resolve_base(cfg, session) else {
+    let Ok(b) = resolve_base(cfg, session, l.provision) else {
         std::process::exit(1);
     };
     let base_dir = b.base.parent().map(Path::to_path_buf).unwrap_or_default();
@@ -1118,9 +1411,17 @@ pub fn wait_ssh(cfg: &Resolved, session: &str, host_user: &str) -> bool {
 }
 
 /// Attach over ssh (replaces this process).
-pub fn attach(cfg: &Resolved, session: &str, host_user: &str) -> i32 {
+pub fn attach(
+    cfg: &Resolved,
+    session: &str,
+    host_user: &str,
+    env_forward: &[(String, String)],
+    gui_pref: &str,
+    provision: Provision,
+) -> i32 {
     use std::os::unix::process::CommandExt;
-    let port = std::fs::read_to_string(vm_sessions_dir(cfg).join(session).join("ssh_port"))
+    let sdir = vm_sessions_dir(cfg).join(session);
+    let port = std::fs::read_to_string(sdir.join("ssh_port"))
         .map(|s| s.trim_end_matches('\n').to_string())
         .unwrap_or_default();
     if port.is_empty() {
@@ -1131,22 +1432,88 @@ pub fn attach(cfg: &Resolved, session: &str, host_user: &str) -> i32 {
     }
     out("");
     out("  Welcome to llm in a box... where agents are constrained");
+
+    // Credentials and the GUI marker in one ssh exec, before the interactive
+    // session: the values are therefore always the host's current ones, and a
+    // GUI app installed since the last attach is honoured without a flag.
+    // Retry once: the very first probe can lose a race with the guest's sshd
+    // shortly after boot, and a failed probe used to look exactly like "this
+    // box is already configured" — which silently suppressed the hint on a
+    // fresh box (reported by a user, not by the test that passed here).
+    let mut probe = sync_and_probe_gui(&port, host_user, env_forward);
+    if !probe.contains("__state__") {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        probe = sync_and_probe_gui(&port, host_user, env_forward);
+    }
+    let (marker, fresh_from_probe) = parse_probe(&probe);
+    // If the probe still failed, fall back to what the launcher already knows:
+    // a slim (core) image that has never been provisioned. This is the signal
+    // that cannot race.
+    let fresh = if probe.contains("__state__") {
+        fresh_from_probe
+    } else {
+        provision == Provision::Core
+    };
+    if marker != GuiTransport::None {
+        // Cache it so `--list` can report it without ssh.
+        let _ = std::fs::write(
+            sdir.join("gui"),
+            format!("transport={}\nsince={}\n", marker.label(), now_stamp()),
+        );
+    } else {
+        let _ = std::fs::remove_file(sdir.join("gui"));
+    }
+
+    if fresh {
+        crate::session::slim_hint();
+    }
     out("");
-    let e = std::process::Command::new("ssh")
-        .args([
-            "-t",
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
-            "-p",
-            &port,
-            &format!("{host_user}@127.0.0.1"),
-            "cd /data 2>/dev/null || true; exec bash",
-        ])
-        .exec();
-    err(&format!("ERROR: could not exec ssh: {e}"));
+
+    let gui = choose_gui(
+        gui_pref,
+        marker,
+        crate::util::which("xauth").is_some(),
+        std::env::var_os("DISPLAY").is_some_and(|d| !d.is_empty()),
+        crate::util::which("waypipe").is_some(),
+        std::env::var_os("WAYLAND_DISPLAY").is_some_and(|d| !d.is_empty()),
+    );
+    if gui != GuiTransport::None {
+        out(&format!(
+            "==> GUI app in this box: forwarding {} ({})",
+            gui.label(),
+            if gui == GuiTransport::Wayland {
+                "waypipe over ssh"
+            } else {
+                "ssh X11 forwarding"
+            }
+        ));
+    } else if marker != GuiTransport::None && gui_pref.is_empty() {
+        err(&format!(
+            "NOTE: this box has a GUI app ({}), but this host cannot forward a display",
+            marker.label()
+        ));
+        err("      (ssh needs $DISPLAY plus xauth; waypipe needs $WAYLAND_DISPLAY plus waypipe).");
+        err("      Continuing without one. For a headless host, run the app under Xvfb");
+        err("      in the box and publish a VNC port (lbx --publish <port>:<port>).");
+    }
+
+    let argv = attach_argv(
+        &port,
+        host_user,
+        gui,
+        "cd /data 2>/dev/null || true; exec bash",
+    );
+    let e = std::process::Command::new(&argv[0]).args(&argv[1..]).exec();
+    err(&format!("ERROR: could not exec {}: {e}", argv[0]));
     1
+}
+
+/// `YYYY-MM-DDTHH:MM:SSZ` without a chrono dependency.
+fn now_stamp() -> String {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => format!("{}", d.as_secs()),
+        Err(_) => "0".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -1284,6 +1651,124 @@ mod tests {
         assert!(!got.contains(&"-chardev".to_string()));
     }
 
+    fn v2(a: &[&str]) -> Vec<String> {
+        a.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// The probe's answer, including the state section that used to be parsed
+    /// by three inline string operations with no test (a fresh box silently
+    /// did not get its hint).
+    #[test]
+    fn probe_parse() {
+        // Fresh slim box, no GUI app.
+        assert_eq!(
+            parse_probe("__gui__\n__state__\nprovisioned=no\n"),
+            (GuiTransport::None, true)
+        );
+        // Same box with an X11 app declared.
+        assert_eq!(
+            parse_probe("__gui__\ntransport=x11\n__state__\nprovisioned=no\n"),
+            (GuiTransport::X11, true)
+        );
+        // Already provisioned: no hint, marker still honoured.
+        assert_eq!(
+            parse_probe("__gui__\ntransport=wayland\n__state__\nprovisioned=yes\n"),
+            (GuiTransport::Wayland, false)
+        );
+        // Pre-split image: no lbx-setup at all, so never told to run it.
+        assert_eq!(
+            parse_probe("__gui__\n__state__\nprovisioned=na\n"),
+            (GuiTransport::None, false)
+        );
+        // A failed probe (empty) must not nag or forward.
+        assert_eq!(parse_probe(""), (GuiTransport::None, false));
+    }
+
+    #[test]
+    fn gui_marker_parsing() {
+        assert_eq!(
+            parse_gui_marker("app=x\ntransport=x11\n"),
+            GuiTransport::X11
+        );
+        assert_eq!(
+            parse_gui_marker("transport=x11-trusted"),
+            GuiTransport::X11Trusted
+        );
+        assert_eq!(
+            parse_gui_marker("transport=trusted"),
+            GuiTransport::X11Trusted
+        );
+        assert_eq!(parse_gui_marker("transport=wayland"), GuiTransport::Wayland);
+        assert_eq!(parse_gui_marker("x11\n"), GuiTransport::X11);
+        assert_eq!(parse_gui_marker("transport=ansi"), GuiTransport::None);
+        assert_eq!(parse_gui_marker(""), GuiTransport::None);
+        assert_eq!(parse_gui_marker("app=open-codesign\n"), GuiTransport::None);
+    }
+
+    /// The whole rule: explicit flags win, `auto` needs a usable host, and a
+    /// Wayland app falls back to X11 rather than to nothing.
+    #[test]
+    fn gui_choice_matrix() {
+        use GuiTransport::*;
+        // auto: no app -> nothing, whatever the host has.
+        assert_eq!(choose_gui("", None, true, true, true, true), None);
+        // auto + x11 app: needs xauth AND a display.
+        assert_eq!(choose_gui("", X11, true, true, false, false), X11);
+        assert_eq!(choose_gui("", X11, false, true, false, false), None);
+        assert_eq!(choose_gui("", X11, true, false, false, false), None);
+        // auto + wayland app: waypipe when possible, else X11, else nothing.
+        assert_eq!(choose_gui("", Wayland, true, true, true, true), Wayland);
+        assert_eq!(choose_gui("", Wayland, true, true, false, false), X11);
+        assert_eq!(choose_gui("", Wayland, false, false, false, false), None);
+        // explicit flags are honoured even with no host support, except none.
+        assert_eq!(choose_gui("x11", None, false, false, false, false), X11);
+        assert_eq!(
+            choose_gui("x11-trusted", None, false, false, false, false),
+            X11Trusted
+        );
+        assert_eq!(
+            choose_gui("wayland", None, false, false, false, false),
+            Wayland
+        );
+        assert_eq!(choose_gui("none", X11, true, true, true, true), None);
+    }
+
+    /// Exact argv, the way every other vector in this project is pinned.
+    #[test]
+    fn attach_argv_vectors() {
+        let cmd = "cd /data 2>/dev/null || true; exec bash";
+        assert_eq!(
+            attach_argv("2222", "dev", GuiTransport::None, cmd),
+            v2(&[
+                "ssh",
+                "-t",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "-p",
+                "2222",
+                "dev@127.0.0.1",
+                cmd
+            ])
+        );
+        assert_eq!(
+            attach_argv("2222", "dev", GuiTransport::X11, cmd)[..3],
+            ["ssh", "-t", "-X"]
+        );
+        assert_eq!(
+            attach_argv("2222", "dev", GuiTransport::X11Trusted, cmd)[..3],
+            ["ssh", "-t", "-Y"]
+        );
+        let wayland = attach_argv("2223", "dev", GuiTransport::Wayland, cmd);
+        assert_eq!(wayland[..3], ["waypipe", "ssh", "-t"]);
+        assert_eq!(wayland[3], "-o");
+        assert!(wayland.contains(&"2223".to_string()));
+        assert_eq!(wayland.last().map(String::as_str), Some(cmd));
+        // No ssh flag leaks into the waypipe form.
+        assert!(!wayland.iter().any(|a| a == "-X" || a == "-Y"));
+    }
+
     #[test]
     fn seed_text_plain_and_netwall() {
         let s = Seed {
@@ -1291,7 +1776,6 @@ mod tests {
             host_uid: 1000,
             host_gid: 1000,
             hostname: "s".into(),
-            gh_token: None,
             ssh_pubkeys: vec![],
             netwall: false,
         };
@@ -1300,14 +1784,13 @@ mod tests {
             "HOST_USER=dev\nHOST_UID=1000\nHOST_GID=1000\nHOSTNAME=s\n"
         );
         let s = Seed {
-            gh_token: Some("ghp_a b".into()),
             ssh_pubkeys: vec!["ssh-ed25519 AAAA dev@h".into(), "ssh-rsa BBBB".into()],
             netwall: true,
             ..s
         };
         assert_eq!(
             seed_text(&s),
-            "HOST_USER=dev\nHOST_UID=1000\nHOST_GID=1000\nHOSTNAME=s\nGH_TOKEN='ghp_a b'\nSSH_PUBKEY=$'ssh-ed25519 AAAA dev@h\\nssh-rsa BBBB'\nHTTP_PROXY=http://10.0.2.100:3128\nHTTPS_PROXY=http://10.0.2.100:3128\nhttp_proxy=http://10.0.2.100:3128\nhttps_proxy=http://10.0.2.100:3128\nNO_PROXY=localhost,127.0.0.1,10.0.2.0/24\nno_proxy=localhost,127.0.0.1,10.0.2.0/24\nJAVA_TOOL_OPTIONS='-Dhttp.proxyHost=10.0.2.100 -Dhttp.proxyPort=3128 -Dhttps.proxyHost=10.0.2.100 -Dhttps.proxyPort=3128 -Dhttp.nonProxyHosts=localhost|127.0.0.1|10.0.2.*'\n"
+            "HOST_USER=dev\nHOST_UID=1000\nHOST_GID=1000\nHOSTNAME=s\nSSH_PUBKEY=$'ssh-ed25519 AAAA dev@h\\nssh-rsa BBBB'\nHTTP_PROXY=http://10.0.2.100:3128\nHTTPS_PROXY=http://10.0.2.100:3128\nhttp_proxy=http://10.0.2.100:3128\nhttps_proxy=http://10.0.2.100:3128\nNO_PROXY=localhost,127.0.0.1,10.0.2.0/24\nno_proxy=localhost,127.0.0.1,10.0.2.0/24\nJAVA_TOOL_OPTIONS='-Dhttp.proxyHost=10.0.2.100 -Dhttp.proxyPort=3128 -Dhttps.proxyHost=10.0.2.100 -Dhttps.proxyPort=3128 -Dhttp.nonProxyHosts=localhost|127.0.0.1|10.0.2.*'\n"
         );
     }
 
@@ -1320,6 +1803,11 @@ mod tests {
             image_sysbox: "llm-in-a-box:sysbox".into(),
             image_docker: "llm-in-a-box:docker".into(),
             image_vm: "llm-in-a-box:vm".into(),
+            image_sysbox_slim: "llm-in-a-box:sysbox-slim".into(),
+            image_docker_slim: "llm-in-a-box:docker-slim".into(),
+            image_vm_slim: "llm-in-a-box:vm-slim".into(),
+            mode: "full".into(),
+            env_forward: vec![],
             state_dir: state.to_path_buf(),
             vm_mem: "16384".into(),
             vm_cpus: "8".into(),
@@ -1506,21 +1994,21 @@ mod tests {
         std::fs::write(state.join("base.qcow2"), "legacy").unwrap_or_else(|e| panic!("{e}"));
         std::fs::write(state.join("vmlinuz"), "legacy").unwrap_or_else(|e| panic!("{e}"));
         // No record: latest.
-        let b = resolve_base(&c, "new").unwrap_or_else(|e| panic!("{e:?}"));
+        let b = resolve_base(&c, "new", "full").unwrap_or_else(|e| panic!("{e:?}"));
         assert_eq!(b.base, bases.join("ts2/base.qcow2"));
         assert_eq!(b.vmlinuz, bases.join("ts2/vmlinuz"));
         assert_eq!(b.initrd, bases.join("ts2/initrd.img"));
         // A record wins over latest.
         std::fs::create_dir_all(state.join("sessions/old")).unwrap_or_else(|e| panic!("{e}"));
         std::fs::write(state.join("sessions/old/base"), "ts1\n").unwrap_or_else(|e| panic!("{e}"));
-        let b = resolve_base(&c, "old").unwrap_or_else(|e| panic!("{e:?}"));
+        let b = resolve_base(&c, "old", "full").unwrap_or_else(|e| panic!("{e:?}"));
         assert_eq!(b.base, bases.join("ts1/base.qcow2"));
         // A record of a base that no longer exists is an error.
         std::fs::write(state.join("sessions/old/base"), "gone\n").unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(resolve_base(&c, "old").err(), Some(Printed));
+        assert_eq!(resolve_base(&c, "old", "full").err(), Some(Printed));
         // Without any versioned base the legacy flat layout is used.
         std::fs::remove_dir_all(&bases).unwrap_or_else(|e| panic!("{e}"));
-        let b = resolve_base(&c, "new").unwrap_or_else(|e| panic!("{e:?}"));
+        let b = resolve_base(&c, "new", "full").unwrap_or_else(|e| panic!("{e:?}"));
         assert_eq!(b.base, state.join("base.qcow2"));
         assert!(crate::session::vm_built(&c));
     }

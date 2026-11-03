@@ -4,7 +4,7 @@
 |----------|----------|
 | [../README.md](../README.md) | Project overview: what lbx is, the ten-minute docker path, the sysbox and vm paths, unattended runs, net policies, sessions, configuration, the old-launcher compatibility note, testing, license |
 | [testing.md](testing.md) | Running the test suites, what a local run needs, how continuous integration judges them, approved skips, the image cache |
-| [in-box-agents.md](in-box-agents.md) | What the image installs: Claude Code, Pi and its plugins, OpenCode, OMP, the Umans CLI, the toolchains; provider setup inside a box |
+| [in-box-agents.md](in-box-agents.md) | What the image installs (full and slim modes): Claude Code, Pi and its plugins, OpenCode, OMP, the Umans CLI, the toolchains, `lbx-setup`; provider setup and host-forwarded model keys inside a box |
 | [session-removal-disambiguation.md](session-removal-disambiguation.md) | Removing or stopping one instance of a legacy duplicate name |
 | [sysbox-runtime.md](sysbox-runtime.md) | The sysbox runtime: version and package requirements (0.7.1, fuse3), how ownership works inside a fake-root box, the daemon-restart failure that makes sudo report `uid 65534`, the remedy, and what `lbx` detects |
 | [sysbox-migration.md](sysbox-migration.md) | Migrating sysbox boxes onto a usable stack (`lbx --migrate`): when it is needed and the order to do it in, what survives (agent sessions) and what does not (hand-installed packages), how to verify a migration, notes on running it under sudo, and the test map |

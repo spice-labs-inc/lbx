@@ -237,7 +237,22 @@ pub fn list_sessions(cfg: &Resolved) -> Vec<String> {
             let port = read_trim(&vms.join(&name).join("ssh_port")).unwrap_or_else(|| "-".into());
             let policy =
                 read_trim(&vms.join(&name).join("net-policy")).unwrap_or_else(|| "-".into());
-            rows.push(format!("{name}|vm|{state}|{port}|{policy}"));
+            // The mode is a property of the base disk the overlay chains to.
+            let base = read_trim(&vms.join(&name).join("base")).unwrap_or_default();
+            let mode = if base.is_empty() {
+                "-".to_string()
+            } else {
+                read_trim(&cfg.state_dir.join("bases").join(&base).join("provision"))
+                    .map(|p| if p == "core" { "slim" } else { "full" }.to_string())
+                    .unwrap_or_else(|| "full".into())
+            };
+            // GUI is the transport a GUI app in the box declared (the marker
+            // attach caches); a container box has no display transport.
+            let gui = crate::vm::gui_cache(cfg, &name)
+                .map(|t| crate::vm::parse_gui_marker(&t).label().to_string())
+                .filter(|l| l != "none")
+                .unwrap_or_else(|| "-".into());
+            rows.push(format!("{name}|vm|{state}|{port}|{policy}|{mode}|{gui}"));
         }
     }
     if Docker::available() {
@@ -255,31 +270,49 @@ pub fn list_sessions(cfg: &Resolved) -> Vec<String> {
             if policy.is_empty() {
                 policy = "-".into();
             }
-            rows.push(format!("{cname}|{}|{}|-|{policy}", c.runtime, c.state));
+            let mode = match crate::mode::Provision::from_label(&Docker::container_label(
+                &cname,
+                crate::mode::LABEL,
+            )) {
+                Some(crate::mode::Provision::Core) => "slim".to_string(),
+                Some(crate::mode::Provision::Full) => "full".to_string(),
+                // Old boxes predate the label: they are the full image.
+                None => "-".to_string(),
+            };
+            rows.push(format!(
+                "{cname}|{}|{}|-|{policy}|{mode}|-",
+                c.runtime, c.state
+            ));
         }
     }
     format_list(rows)
 }
 
-/// The `--list` table from `name|runtime|state|port|policy` rows: sorted
-/// bytewise by the whole row (name first), fixed column widths.
+/// The `--list` table from `name|runtime|state|port|policy|mode|gui` rows:
+/// sorted bytewise by the whole row (name first), fixed column widths.
 pub fn format_list(mut rows: Vec<String>) -> Vec<String> {
     rows.sort();
     let mut lines = vec![format!(
-        "{:<24} {:<8} {:<10} {:<6} {}",
-        "NAME", "RUNTIME", "STATE", "PORT", "NET-POLICY"
+        "{:<24} {:<8} {:<10} {:<6} {:<18} {:<6} {}",
+        "NAME", "RUNTIME", "STATE", "PORT", "NET-POLICY", "MODE", "GUI"
     )];
     for row in rows {
         let f: Vec<&str> = row.split('|').collect();
         let g = |i: usize| f.get(i).copied().unwrap_or("");
-        lines.push(format!(
-            "{:<24} {:<8} {:<10} {:<6} {}",
-            g(0),
-            g(1),
-            g(2),
-            g(3),
-            g(4)
-        ));
+        lines.push(
+            format!(
+                "{:<24} {:<8} {:<10} {:<6} {:<18} {:<6} {}",
+                g(0),
+                g(1),
+                g(2),
+                g(3),
+                g(4),
+                g(5),
+                g(6)
+            )
+            .trim_end()
+            .to_string(),
+        );
     }
     lines
 }
@@ -512,6 +545,13 @@ pub struct Launch<'a> {
     pub cfg: &'a Resolved,
     pub session: String,
     pub runtime: String,
+    /// The image resolved for this launch's mode (full or slim).
+    pub image: String,
+    /// `full` or `core`: recorded on the container so `--list` can report it.
+    pub provision: String,
+    /// Host variables to forward into the box (names are printed, values are
+    /// never printed: they are the model-provider credentials).
+    pub env_forward: Vec<(String, String)>,
     pub host_user: String,
     pub host_uid: u32,
     pub host_gid: u32,
@@ -521,6 +561,13 @@ pub struct Launch<'a> {
     pub vm_web_port: String,
     pub devices: Vec<String>,
     pub net_policy: String,
+}
+
+impl Launch<'_> {
+    /// The image mode as a typed value (the struct carries the label).
+    fn provision_mode(&self) -> crate::mode::Provision {
+        crate::mode::Provision::from_label(&self.provision).unwrap_or(crate::mode::Provision::Full)
+    }
 }
 
 fn wait_for_running(session: &str) -> bool {
@@ -585,8 +632,43 @@ fn sysbox_box_damage_report(session: &str) {
     err(&format!("         lbx --runtime sysbox {session}"));
 }
 
+/// A slim box that has nothing installed yet gets one nudge at attach. It is
+/// a hint, not a prompt: attach is scriptable (`lbx s && claude -p …`), so a
+/// blocking TUI there would break automation and `--run`. The condition is the
+/// provisioning log the steps write — a full image has it from build time, a
+/// slim box only after `lbx-setup` ran — plus the presence of `lbx-setup`
+/// itself (pre-split images have neither, and must not be told to run it).
+pub fn slim_hint() {
+    out("");
+    out("  This box has nothing installed yet (slim image).");
+    out("    lbx-setup            tick what to install (checklist)");
+    out("    lbx-setup --list     what is available, what is installed");
+    out("    lbx-setup claude     one step: also rust, jvm, python, bun, omp, …");
+}
+
+/// True when this box needs the hint: `lbx-setup` present, nothing recorded.
+/// `provision` is the resolved image's mode, used when the probe fails: a
+/// failed `docker exec` must not be mistaken for "already configured".
+fn needs_slim_hint(session: &str, provision: crate::mode::Provision) -> bool {
+    match Docker::line(&[
+        "exec",
+        session,
+        "sh",
+        "-c",
+        "test -x /usr/local/bin/lbx-setup && [ ! -s /home/agent/.lbx/provisioned.log ] && echo fresh",
+    ]) {
+        Some(l) => l.trim() == "fresh",
+        None => provision == crate::mode::Provision::Core,
+    }
+}
+
 /// Attach: exec into the box (replaces this process on success).
-fn attach_session(session: &str, host_user: &str) -> i32 {
+fn attach_session(
+    session: &str,
+    host_user: &str,
+    env_forward: &[(String, String)],
+    provision: crate::mode::Provision,
+) -> i32 {
     use std::os::unix::process::CommandExt;
     for _ in 0..30 {
         if Docker::quiet(&["exec", session, "test", "-f", "/tmp/.user-ready"]) {
@@ -603,21 +685,34 @@ fn attach_session(session: &str, host_user: &str) -> i32 {
     }
     out("");
     out("  Welcome to llm in a box... where agents are constrained");
+    if needs_slim_hint(session, provision) {
+        slim_hint();
+    }
     out("");
-    let e = std::process::Command::new("docker")
-        .args([
-            "exec",
-            "-it",
-            "-e",
-            "HOME=/home/agent",
-            "-w",
-            "/data",
-            session,
-            "gosu",
-            &exec_user,
-            "bash",
-        ])
-        .exec();
+    // Credentials (and anything else `--env`/`env.forward` names) are passed
+    // on the EXEC, not at `docker run`: exec env is not stored in the
+    // container's config, so `docker inspect` never shows a token, a rotated
+    // key is picked up on the next attach, and the values disappear with the
+    // session instead of outliving it.
+    let mut argv: Vec<String> = vec![
+        "exec".into(),
+        "-it".into(),
+        "-e".into(),
+        "HOME=/home/agent".into(),
+    ];
+    for (name, value) in env_forward {
+        argv.push("-e".into());
+        argv.push(format!("{name}={value}"));
+    }
+    argv.extend([
+        "-w".to_string(),
+        "/data".to_string(),
+        session.to_string(),
+        "gosu".to_string(),
+        exec_user.clone(),
+        "bash".to_string(),
+    ]);
+    let e = std::process::Command::new("docker").args(&argv).exec();
     err(&format!("ERROR: could not exec docker: {e}"));
     1
 }
@@ -670,7 +765,7 @@ pub fn launch(l: &Launch) -> i32 {
             out(&format!(
                 "==> Attaching to running container '{session}' ({runtime}) ..."
             ));
-            attach_session(session, &l.host_user)
+            attach_session(session, &l.host_user, &l.env_forward, l.provision_mode())
         }
         "exited" | "created" => {
             let stamp = Docker::container_label(session, "llm-in-a-box.user");
@@ -703,7 +798,7 @@ pub fn launch(l: &Launch) -> i32 {
                 sysbox_box_damage_report(session);
                 return 1;
             }
-            attach_session(session, &l.host_user)
+            attach_session(session, &l.host_user, &l.env_forward, l.provision_mode())
         }
         "missing" => create(l),
         other => {
@@ -726,10 +821,7 @@ fn create(l: &Launch) -> i32 {
     out(&format!(
         "==> Creating new container '{session}' ({runtime}) ..."
     ));
-    let mut image = match runtime {
-        "sysbox" => cfg.image_sysbox.clone(),
-        _ => cfg.image_docker.clone(),
-    };
+    let mut image = l.image.clone();
     if !Docker::image_exists(&image) {
         if Docker::image_exists(IMAGE_LEGACY) {
             err(&format!(
@@ -852,10 +944,6 @@ fn create(l: &Launch) -> i32 {
             out(&format!("    (passing through device {dev})"));
         }
     }
-    let gh_token = std::env::var("GH_TOKEN").ok().filter(|t| !t.is_empty());
-    if gh_token.is_some() {
-        out("    (forwarding GH_TOKEN from host environment)");
-    }
     if runtime == "sysbox" {
         out("    (granting NET_ADMIN + /dev/net/tun — sysbox runtime; enables");
         out("     bridged VM networking.)");
@@ -898,6 +986,16 @@ fn create(l: &Launch) -> i32 {
         }
     }
     let box_user = crate::docker::box_user(&image);
+    if !l.env_forward.is_empty() {
+        out(&format!(
+            "    (forwarding from the host environment: {})",
+            l.env_forward
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     let cwd = std::env::current_dir()
         .map(|p| path_str(&p))
         .unwrap_or_default();
@@ -909,7 +1007,7 @@ fn create(l: &Launch) -> i32 {
         host_user: l.host_user.clone(),
         host_uid: l.host_uid,
         host_gid: l.host_gid,
-        gh_token,
+        provision: l.provision.clone(),
         vm_web_port: l.vm_web_port.clone(),
         netwall,
         devices,
@@ -929,7 +1027,7 @@ fn create(l: &Launch) -> i32 {
     if !wait_for_running(session) {
         return 1;
     }
-    attach_session(session, &l.host_user)
+    attach_session(session, &l.host_user, &l.env_forward, l.provision_mode())
 }
 
 /// Extra lines for a failed `docker run` of a new box, keyed on the daemon's
@@ -1081,18 +1179,22 @@ mod tests {
     #[test]
     fn list_rows_sort_bytewise_by_name_with_fixed_columns() {
         let rows = vec![
-            "zeta|docker|running|-|-".to_string(),
-            "Beta|vm|exited|2222|/p/enforce.json".to_string(),
-            "alpha|sysbox|exited|-|-".to_string(),
+            "zeta|docker|running|-|-|-|-".to_string(),
+            "Beta|vm|exited|2222|/p/enforce.json|full|x11".to_string(),
+            "alpha|sysbox|exited|-|-|slim|-".to_string(),
         ];
         let lines = format_list(rows);
         assert_eq!(
             lines,
             vec![
-                "NAME                     RUNTIME  STATE      PORT   NET-POLICY".to_string(),
-                "Beta                     vm       exited     2222   /p/enforce.json".to_string(),
-                "alpha                    sysbox   exited     -      -".to_string(),
-                "zeta                     docker   running    -      -".to_string(),
+                "NAME                     RUNTIME  STATE      PORT   NET-POLICY         MODE   GUI"
+                    .to_string(),
+                "Beta                     vm       exited     2222   /p/enforce.json    full   x11"
+                    .to_string(),
+                "alpha                    sysbox   exited     -      -                  slim   -"
+                    .to_string(),
+                "zeta                     docker   running    -      -                  -      -"
+                    .to_string(),
             ]
         );
         assert_eq!(format_list(Vec::new()).len(), 1);

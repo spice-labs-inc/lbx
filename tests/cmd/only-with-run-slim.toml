@@ -1,0 +1,10 @@
+bin.name = "lbx"
+args = ["--run", "--slim", "probe", "--", "true"]
+status.code = 125
+stdout = ""
+stderr = """
+
+ERROR: --slim cannot be combined with --run.
+
+lbx-run: status=refused code=125
+"""

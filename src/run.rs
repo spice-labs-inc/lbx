@@ -811,7 +811,7 @@ pub fn validate(
         return Err(refuse("--run refuses host group id 0."));
     }
     let mut seen: Vec<&str> = Vec::new();
-    for name in &o.run_envs {
+    for name in &o.envs {
         if !valid_var_name(name) {
             return Err(refuse(&format!(
                 "--env name '{name}' is not a valid variable name."
@@ -892,6 +892,15 @@ pub fn validate(
     if !Docker::image_exists(&cfg.image_docker) {
         return Err(refuse(&format!(
             "image {} is not present locally (build it with ./build docker).",
+            cfg.image_docker
+        )));
+    }
+    // A slim image cannot provision itself here: a run box has no sudo, no
+    // inner docker and a read-only relationship with the host, so the agents
+    // it needs would simply be missing. Refuse the image, not the run.
+    if crate::mode::probe(&cfg.image_docker) == Some(crate::mode::Provision::Core) {
+        return Err(refuse(&format!(
+            "image {} is a slim image (capabilities are installed on demand with lbx-setup).\n       --run boxes cannot provision themselves: no sudo, no inner docker.\n       Point image.docker at the full image (./build docker), or use the slim\n       image para interactive sessions only.",
             cfg.image_docker
         )));
     }
@@ -1390,7 +1399,7 @@ pub fn run_main(
         std::thread::sleep(std::time::Duration::from_secs(timeout));
         TIMER.store(true, Ordering::SeqCst);
     });
-    let exec_argv = run_exec_argv(&n, &o.run_envs, host_user, &o.run_cmd);
+    let exec_argv = run_exec_argv(&n, &o.envs, host_user, &o.run_cmd);
     let child = {
         use std::os::unix::process::CommandExt;
         let mut c = std::process::Command::new("docker");

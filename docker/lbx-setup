@@ -1,0 +1,304 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# lbx-setup — install capabilities into a box, from the box.
+#
+# The slim image (llm-in-a-box:<runtime>-slim) ships the same provisioning
+# steps the fat image runs at build time, and this command runs them on
+# demand:
+#
+#   lbx-setup                 checklist, then install what you tick
+#   lbx-setup rust,jvm        install exactly those
+#   lbx-setup --all           install every step, no questions
+#                             (that is the fat image's set, rust-extras included)
+#   lbx-setup --list          what is available and what is already installed
+#   lbx-setup --status        what was installed, with versions
+#
+# Steps are grouped: a language toolchain (rust is the base toolchain,
+# rust-extras the eight cargo add-ons — compiled from source, ~10 minutes, and
+# not needed day to day), and one step per coding tool, where Pi's extensions
+# are installed by Pi itself (pi install), so `pi update --extensions` and this
+# command cannot disagree.
+#
+# Steps install *latest* by design (the agents are unpinned, Rust is stable),
+# which is the same thing `pi update` does in a fat box. Re-running a step is
+# safe: each one is a no-op when its result is present.
+#
+# The fat image ships this command too, where it reports versions and can
+# refresh the agents — so the two modes differ in *when* the steps run, never
+# in *what* they do.
+# ---------------------------------------------------------------------------
+set -uo pipefail
+
+PROVISION_DIR="${LBX_PROVISION_DIR:-/opt/llm-in-a-box/provision.d}"
+# Tiers. `provision.d` runs at build time in the full image and is the only
+# thing `--all` installs; `optional.d` exists in every slim image; `optional-vm.d`
+# exists only in the vm slim image (GUI apps need a display transport, which
+# only the vm runtime can provide here) and in no full image.
+OPTIONAL_DIR="${LBX_OPTIONAL_DIR:-/opt/llm-in-a-box/optional.d}"
+OPTIONAL_VM_DIR="${LBX_OPTIONAL_VM_DIR:-/opt/llm-in-a-box/optional-vm.d}"
+BOX_USER="$(getent passwd 1000 | cut -d: -f1)"
+BOX_HOME="$(getent passwd "$BOX_USER" | cut -d: -f6)"
+LBX_DIR="$BOX_HOME/.lbx"
+
+ALL_STEPS=(build-tools rust rust-extras jvm python editors bun claude pi opencode omp)
+# Name -> tier's directory, resolved lazily; provision.d wins.
+step_dirs() {
+    printf '%s\n' "$PROVISION_DIR" "$OPTIONAL_DIR" "$OPTIONAL_VM_DIR"
+}
+
+step_desc() {
+    case "$1" in
+        build-tools)  echo "cmake + protoc" ;;
+        rust)         echo "Rust stable toolchain, wasm32, rustfmt/clippy/rust-analyzer" ;;
+        rust-extras)  echo "8 cargo add-ons (wasm-pack, watch, edit, expand, audit, outdated, deny, sccache) — compiled from source, ~10 min, rarely needed" ;;
+        jvm)          echo "OpenJDK 21, Maven, Gradle 9.7.1, sbt" ;;
+        python)       echo "pip, venv, python3-full, Ansible" ;;
+        editors)      echo "Emacs (vim is always present)" ;;
+        bun)          echo "Bun (OMP's runtime)" ;;
+        claude)       echo "Claude Code (latest)" ;;
+        pi)           echo "Pi + its extensions: umans provider, AFT, web access (latest)" ;;
+        opencode)     echo "OpenCode (latest)" ;;
+        omp)          echo "OMP + its Bun runtime gate (latest)" ;;
+        pnpm)        echo "pnpm via corepack (Node monorepos)" ;;
+        design)      echo "Open CoDesign (Electron design app) — vm only, needs X11 forwarding; PDF export needs a local Chrome" ;;
+        *)           echo "" ;;
+    esac
+}
+
+step_file() {
+    local dir f
+    while read -r dir; do
+        for f in "$dir"/[0-9][0-9]-"$1".sh; do
+            [ -f "$f" ] || continue
+            printf '%s\n' "$f"
+            return 0
+        done
+    done < <(step_dirs)
+    return 1
+}
+
+# Steps that are shipped but not part of `--all` (the fat image's set).
+optional_steps() {
+    local dir f name
+    for dir in "$OPTIONAL_DIR" "$OPTIONAL_VM_DIR"; do
+        for f in "$dir"/[0-9][0-9]-*.sh; do
+            [ -f "$f" ] || continue
+            name="$(basename "$f")"
+            name="${name#*-}"; name="${name%.sh}"
+            printf '%s\n' "$name"
+        done
+    done
+}
+
+installed_steps() {
+    [ -f "$LBX_DIR/provisioned.log" ] || return 0
+    awk '{print $2}' "$LBX_DIR/provisioned.log" | sort -u
+}
+
+is_installed() { installed_steps | grep -qx "$1"; }
+
+run_step() {
+    local name="$1" file
+    if ! file="$(step_file "$name")"; then
+        echo "ERROR: unknown step '$name' (known: ${ALL_STEPS[*]})" >&2
+        return 1
+    fi
+    echo ""
+    echo "==> [$name] $(step_desc "$name")"
+    if ! bash "$file"; then
+        echo "ERROR: step '$name' failed; nothing after it was attempted." >&2
+        echo "       Retry with: lbx-setup $name" >&2
+        return 1
+    fi
+}
+
+versions_json() {
+    local rustc_ver pi_ver node_ver java_ver
+    rustc_ver="$("$BOX_HOME"/.cargo/bin/rustc --version 2>/dev/null | awk '{print $2}')"
+    pi_ver="$(pi --version 2>/dev/null | head -1)"
+    node_ver="$(node --version 2>/dev/null)"
+    java_ver="$(java -version 2>&1 | head -1 | sed 's/.*"\(.*\)".*/\1/')"
+    printf '{"updated":"%s","steps":[%s],"versions":{"rustc":"%s","pi":"%s","node":"%s","java":"%s"}}' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        "$(installed_steps | sed 's/.*/"&"/' | paste -sd, -)" \
+        "$rustc_ver" "$pi_ver" "$node_ver" "$java_ver"
+}
+
+write_manifest() {
+    mkdir -p "$LBX_DIR" 2>/dev/null || true
+    versions_json >"$LBX_DIR/provisioned.json" 2>/dev/null || true
+}
+
+cmd_list() {
+    printf '%-14s %-12s %-10s %s\n' STEP STATE TIER DESCRIPTION
+    for s in "${ALL_STEPS[@]}"; do
+        if is_installed "$s"; then state="installed"; else state="-"; fi
+        printf '%-14s %-12s %-10s %s\n' "$s" "$state" "provision" "$(step_desc "$s")"
+    done
+    local o
+    while read -r o; do
+        [ -n "$o" ] || continue
+        if is_installed "$o"; then state="installed"; else state="-"; fi
+        case "$(step_file "$o")" in
+            "$OPTIONAL_VM_DIR"/*) tier="vm-only" ;;
+            *)                    tier="optional" ;;
+        esac
+        printf '%-14s %-12s %-10s %s\n' "$o" "$state" "$tier" "$(step_desc "$o")"
+    done < <(optional_steps)
+    echo ""
+    echo "Install with: lbx-setup <step>[,<step>...]   or: lbx-setup --all"
+    echo "  --all installs the 'provision' tier (what the full image has)."
+    echo "  'optional'/'vm-only' steps are opt-in: name them, or tick them in the checklist."
+    echo "               lbx-setup                 (checklist)"
+}
+
+cmd_status() {
+    if [ ! -f "$LBX_DIR/provisioned.log" ]; then
+        echo "nothing installed by lbx-setup yet"
+    else
+        echo "installed:"
+        sed 's/^/  /' "$LBX_DIR/provisioned.log"
+    fi
+    echo ""
+    for probe in "rustc:$BOX_HOME/.cargo/bin/rustc --version" \
+                 "java:java -version" "node:node --version" \
+                 "pi:pi --version" "claude:claude --version" \
+                 "opencode:opencode --version" "omp:omp --version" \
+                 "aft:aft --version"; do
+        name="${probe%%:*}"
+        cmd="${probe#*:}"
+        if out="$(eval "$cmd" 2>&1 | head -1)" && [ -n "$out" ]; then
+            printf '  %-10s %s\n' "$name" "$out"
+        else
+            printf '  %-10s (missing)\n' "$name"
+        fi
+    done
+}
+
+cmd_ui() {
+    local -a args=() steps=() descs=() selected=()
+    local step flag rc
+    for step in "${ALL_STEPS[@]}"; do
+        flag="off"
+        is_installed "$step" && flag="on"
+        steps+=("$step")
+        descs+=("$(step_desc "$step")")
+        args+=("$step" "$(step_desc "$step")" "$flag")
+    done
+    while read -r step; do
+        [ -n "$step" ] || continue
+        flag="off"
+        is_installed "$step" && flag="on"
+        steps+=("$step")
+        descs+=("[optional] $(step_desc "$step")")
+        args+=("$step" "[optional] $(step_desc "$step")" "$flag")
+    done < <(optional_steps)
+
+    if command -v dialog >/dev/null 2>&1; then
+        # dialog exits 0 (OK), 1 (Cancel) or 255 (ESC); anything else is a
+        # failure to initialise — a terminal whose terminfo is missing
+        # (`TERM=xterm-kitty`) or unset. That must NOT look like a cancelled
+        # checklist: it used to print "cancelled; nothing installed", which is
+        # both wrong and a dead end.
+        selected=()
+        local dlg_out
+        if dlg_out="$(dialog --stdout --separate-output --checklist \
+            "Box setup: tick what this box needs.\n\nEvery step installs the latest release and can be re-run." \
+            22 78 12 "${args[@]}" 2>/tmp/lbx-setup-dialog.$$)"; then
+            rc=0
+        else
+            rc=$?
+        fi
+        if [ "$rc" -le 1 ]; then
+            rm -f "/tmp/lbx-setup-dialog.$$"
+            if [ "$rc" -eq 1 ]; then
+                echo "cancelled; nothing installed"
+                return 0
+            fi
+            if [ -z "$dlg_out" ]; then
+                echo "nothing selected; nothing installed"
+                return 0
+            fi
+            while read -r s; do
+                [ -n "$s" ] || continue
+                selected+=("$s")
+            done <<<"$dlg_out"
+            for s in "${selected[@]}"; do run_step "$s" || return 1; done
+            return 0
+        fi
+        echo "note: dialog could not use this terminal (TERM=${TERM:-unset}); using a plain menu." >&2
+        echo "      (export TERM=xterm-256color usually fixes the TUI.)" >&2
+        rm -f "/tmp/lbx-setup-dialog.$$"
+    else
+        echo "note: dialog is not installed; using a plain menu." >&2
+    fi
+
+    # Plain fallback: numbered list, read numbers or names. Same selection
+    # semantics as the checklist, no curses, works on any terminal.
+    echo ""
+    echo "What this box can install:"
+    local i=1
+    for step in "${steps[@]}"; do
+        printf '  %2d) %-14s %s\n' "$i" "$step" "${descs[$((i - 1))]}"
+        i=$((i + 1))
+    done
+    echo ""
+    printf 'Install which? (numbers or names, space separated; empty = nothing): '
+    local answer
+    if ! read -r answer; then
+        echo ""
+        echo "no input; nothing installed"
+        return 0
+    fi
+    [ -n "$answer" ] || { echo "nothing selected; nothing installed"; return 0; }
+    local word num
+    selected=()
+    for word in $answer; do
+        if [[ "$word" =~ ^[0-9]+$ ]]; then
+            num=$((word - 1))
+            if [ "$num" -lt 0 ] || [ "$num" -ge "${#steps[@]}" ]; then
+                echo "ERROR: there is no step $word." >&2
+                return 1
+            fi
+            selected+=("${steps[$num]}")
+        else
+            if ! step_file "$word" >/dev/null; then
+                echo "ERROR: unknown step '$word' (see: lbx-setup --list)." >&2
+                return 1
+            fi
+            selected+=("$word")
+        fi
+    done
+    for s in "${selected[@]}"; do run_step "$s" || return 1; done
+}
+
+main() {
+    if [ -z "$BOX_USER" ]; then
+        echo "ERROR: no uid-1000 box user found; is this an llm-in-a-box image?" >&2
+        return 1
+    fi
+    case "${1:-}" in
+        --list|-l) cmd_list; return 0 ;;
+        --status|-s) cmd_status; return 0 ;;
+        --all|-a)
+            local s
+            for s in "${ALL_STEPS[@]}"; do run_step "$s" || return 1; done
+            write_manifest; return 0 ;;
+        --help|-h)
+            awk 'NR > 1 && /^#/ { print; next } NR > 1 { exit }' "$0" \
+                | sed 's/^# \{0,1\}//'; return 0 ;;
+        "")
+            if [ -t 0 ] && [ -t 1 ]; then
+                cmd_ui || return 1
+                write_manifest; return 0
+            fi
+            echo "no terminal and no steps named; use --list, --all, or a step list" >&2
+            return 1 ;;
+        *)
+            local name
+            for name in ${1//,/ }; do run_step "$name" || return 1; done
+            write_manifest; return 0 ;;
+    esac
+}
+
+main "$@"

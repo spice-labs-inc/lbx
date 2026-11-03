@@ -7,6 +7,7 @@ container inspect llm-in-a-box-relay-job2
 network inspect llm-in-a-box-net-job2
 network inspect llm-in-a-box-relaynet-job2
 image inspect llm-in-a-box:docker
+image inspect --format {{index .Config.Labels "llm-in-a-box.provision"}} llm-in-a-box:docker
 image inspect llm-in-a-box-relay:latest
 network create --internal -o com.docker.network.bridge.inhibit_ipv4=true llm-in-a-box-net-job2 --label llm-in-a-box.run-id=[RUN-ID]
 network create llm-in-a-box-relaynet-job2 --label llm-in-a-box.run-id=[RUN-ID]

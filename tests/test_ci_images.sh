@@ -95,7 +95,13 @@ fake_state() {
     mkdir -p "$1/bin" "$1/home"
     ln -sf "$SCRIPT_DIR/fake-docker-registry.sh" "$1/bin/docker"
     printf '%s\n' '#!/usr/bin/env bash' \
-        '[ "$1" = --print-images ] && echo "sysbox=llm-in-a-box:sysbox docker=llm-in-a-box:docker vm=llm-in-a-box:vm"' > "$1/bin/lbx"
+        'if [ "$1" = --print-images ]; then' \
+        '  if [ "${2:-}" = --slim ]; then' \
+        '    echo "sysbox=llm-in-a-box:sysbox-slim docker=llm-in-a-box:docker-slim vm=llm-in-a-box:vm-slim"' \
+        '  else' \
+        '    echo "sysbox=llm-in-a-box:sysbox docker=llm-in-a-box:docker vm=llm-in-a-box:vm"' \
+        '  fi' \
+        'fi' > "$1/bin/lbx"
     chmod +x "$1/bin/lbx"
     : > "$1/docker.log"
     : > "$1/local"

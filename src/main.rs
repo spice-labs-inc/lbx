@@ -87,10 +87,19 @@ fn main() {
         err("WARNING: the config file is unusable; proceeding with defaults.");
     }
     if o.print_images {
-        out(&format!(
-            "sysbox={} docker={} vm={}",
-            cfg.image_sysbox, cfg.image_docker, cfg.image_vm
-        ));
+        // Build parity: ./build asks for the fat refs (no flag) and the slim
+        // refs (--slim), so a build and a launch cannot disagree.
+        if o.slim {
+            out(&format!(
+                "sysbox={} docker={} vm={}",
+                cfg.image_sysbox_slim, cfg.image_docker_slim, cfg.image_vm_slim
+            ));
+        } else {
+            out(&format!(
+                "sysbox={} docker={} vm={}",
+                cfg.image_sysbox, cfg.image_docker, cfg.image_vm
+            ));
+        }
         std::process::exit(0);
     }
     if o.print_state_dir {
@@ -326,12 +335,45 @@ fn main() {
             &host_user,
         ));
     }
+
+    // Image mode (full | slim) for this launch. Nothing above needed an image:
+    // destroy/stop/list exit earlier.
+    //
+    // An EXISTING box keeps the image it was built from. Attaching to, or
+    // starting, a box must never depend on the image that this invocation
+    // would have created (you can launch a stopped slim box without having
+    // built the slim image again, and without --slim).
+    let existing = if runtime == "vm" {
+        session::vm_state_for(&cfg, &o.session) != "missing"
+    } else {
+        Docker::container_fmt(&o.session, "{{.Config.Image}}").is_some()
+    };
+    let (image, provision) = match lbx::mode::resolve(&cfg, &runtime, o.slim, o.full) {
+        Ok(v) => v,
+        Err(_m) if existing => {
+            let img = Docker::container_fmt(&o.session, "{{.Config.Image}}").unwrap_or_default();
+            let prov = lbx::mode::Provision::from_label(&Docker::container_label(
+                &o.session,
+                lbx::mode::LABEL,
+            ))
+            .unwrap_or(lbx::mode::Provision::Full);
+            (img, prov)
+        }
+        Err(m) => {
+            err(&m);
+            std::process::exit(1);
+        }
+    };
+    let env_forward = collect_env_forward(&o, &cfg);
     if runtime == "vm" {
-        let _ = lbx::vm::preflight(&cfg, &o.session, &sdir);
+        let _ = lbx::vm::preflight(&cfg, &o.session, &sdir, &image, provision.name());
         let state = session::vm_state_for(&cfg, &o.session);
         let la = lbx::vm::LaunchArgs {
             cfg: &cfg,
             session: &o.session,
+            image: &image,
+            provision: provision.name(),
+            env_forward: &env_forward,
             host_user: &host_user,
             host_uid,
             host_gid,
@@ -344,7 +386,14 @@ fn main() {
         match state.as_str() {
             "running" => {
                 out(&format!("==> Attaching to running vm '{}' ...", o.session));
-                std::process::exit(lbx::vm::attach(&cfg, &o.session, &host_user));
+                std::process::exit(lbx::vm::attach(
+                    &cfg,
+                    &o.session,
+                    &host_user,
+                    &env_forward,
+                    &o.gui,
+                    provision,
+                ));
             }
             "exited" => {
                 if session::vm_live_pid_for(&cfg, &o.session).is_some() {
@@ -352,7 +401,14 @@ fn main() {
                         "==> vm '{}' is running (stale state files) — attaching ...",
                         o.session
                     ));
-                    std::process::exit(lbx::vm::attach(&cfg, &o.session, &host_user));
+                    std::process::exit(lbx::vm::attach(
+                        &cfg,
+                        &o.session,
+                        &host_user,
+                        &env_forward,
+                        &o.gui,
+                        provision,
+                    ));
                 }
                 out(&format!("==> Restarting stopped vm '{}' ...", o.session));
             }
@@ -362,12 +418,22 @@ fn main() {
         if !lbx::vm::wait_ssh(&cfg, &o.session, &host_user) {
             std::process::exit(1);
         }
-        std::process::exit(lbx::vm::attach(&cfg, &o.session, &host_user));
+        std::process::exit(lbx::vm::attach(
+            &cfg,
+            &o.session,
+            &host_user,
+            &env_forward,
+            &o.gui,
+            provision,
+        ));
     }
     let code = session::launch(&session::Launch {
         cfg: &cfg,
         session: o.session.clone(),
         runtime,
+        image,
+        provision: provision.label().to_string(),
+        env_forward,
         host_user,
         host_uid,
         host_gid,
@@ -458,4 +524,60 @@ fn denied(cfg: &config::Resolved, name: &str) -> ! {
         ));
     }
     std::process::exit(0);
+}
+
+/// Which host variables reach the box.
+///
+/// `--env NAME` wins over the configured list (interactive sessions and `--run`
+/// share the flag). Names are printed, values never are: these are the
+/// provider credentials the in-box agents read, and they must not land in a
+/// log. A name that is unset on the host is skipped, not fatal — a box that
+/// runs with OAuth inside does not need an API key from the host.
+fn collect_env_forward(o: &Options, cfg: &config::Resolved) -> Vec<(String, String)> {
+    let explicit = !o.envs.is_empty();
+    let names: Vec<String> = if explicit {
+        o.envs.clone()
+    } else {
+        cfg.env_forward.clone()
+    };
+    let reserved = [
+        "HOST_USER",
+        "HOST_UID",
+        "HOST_GID",
+        "HOSTNAME",
+        "HOME",
+        "PATH",
+        "VM_WEB_PORT",
+    ];
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out: Vec<(String, String)> = Vec::new();
+    for name in names {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        if !config::var_name_ok(&name) {
+            err(&format!(
+                "WARNING: --env '{name}': not a valid variable name; skipped."
+            ));
+            continue;
+        }
+        if reserved.contains(&name.as_str())
+            || name.starts_with("LBX_")
+            || name.starts_with("LLMBOX_")
+        {
+            err(&format!("WARNING: --env {name}: reserved name; skipped."));
+            continue;
+        }
+        match std::env::var(&name) {
+            Ok(v) if !v.is_empty() => out.push((name, v)),
+            _ => {
+                if explicit {
+                    err(&format!(
+                        "WARNING: --env {name}: not set on the host; not forwarded."
+                    ));
+                }
+            }
+        }
+    }
+    out
 }

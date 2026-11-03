@@ -7,6 +7,16 @@ pub const USAGE: &str = r#"Usage: lbx [options] <session_name>
 Options:
   --runtime <sysbox|docker|vm>          Choose isolation runtime (default: auto-detect;
                                         see runtime.default in the config file)
+  --slim                                Launch the slim image for this runtime: capabilities
+                                        are installed inside the box with lbx-setup
+  --full                                Launch the preprovisioned image (the default)
+  --env <NAME>                          Forward host variable NAME into the box
+                                        (repeatable; interactive sessions and --run)
+  --no-gui                              Do not forward a display even if the box
+                                        has a GUI app (vm attach only)
+  --x11[=trusted]                       Force X11 forwarding on this attach
+                                        (=trusted is ssh -Y; default ssh -X)
+  --wayland                             Force wayland (waypipe ssh) on this attach
   --device <path>                       Pass a host device into the session (repeatable)
   --fuse                                Enable FUSE support
   --ports                               Expose session ports 8080 and 3000 on the host
@@ -27,6 +37,7 @@ Options:
   --net-policy <file>                    Host-side network wall policy (JSON: mode/allow/block); default: no wall
   --denied <name>                        Print the session's deny log
   --print-images                        Print the configured image refs (build parity; internal)
+                                        With --slim: the slim refs instead
   --print-state-dir                     Print the resolved state directory (build parity; internal)
   --run                                 Unattended run: run one command in a new, locked-down box,
                                         then remove the box (see "Unattended runs" below)
@@ -78,6 +89,10 @@ Configuration (precedence: CLI flag > env var > config file > default):
   File:   $LBX_CONFIG (default ~/.config/llm_in_a_box/config).
           Lines are key=value; # comments allowed.
   Keys:   image.sysbox|image.docker|image.vm   image refs (default llm-in-a-box:*)
+          image.<runtime>.slim                 slim refs (default <image>-slim)
+          mode             LBX_MODE             full (default) | slim | auto
+          env.forward      LBX_ENV_FORWARD      host variables forwarded at attach
+                                               (default: GH_TOKEN; add model keys here)
           state.dir        LBX_STATE_DIR        global box-state dir (default ~/.llm-in-a-box)
           vm.mem           LBX_VM_MEM           vm memory in MiB (default 16384)
           vm.cpus          LBX_VM_CPUS          vm vCPUs (default 8)
@@ -96,6 +111,17 @@ Configuration (precedence: CLI flag > env var > config file > default):
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Options {
     pub runtime: String,
+    /// `--slim` / `--full`: the image mode for this launch (CLI wins over the
+    /// `mode` config key). Neither flag means "use the config".
+    pub slim: bool,
+    pub full: bool,
+    /// `--env NAME`, repeatable: host variables to forward. Interactive
+    /// sessions put them in the box's environment; `--run` hands them to the
+    /// command.
+    pub envs: Vec<String>,
+    /// Display transport override for a vm attach: "" (auto, driven by the
+    /// box's `~/.lbx/gui` marker), "none", "x11", "x11-trusted", "wayland".
+    pub gui: String,
     pub devices: Vec<String>,
     pub fuse: bool,
     pub ports: bool,
@@ -119,7 +145,6 @@ pub struct Options {
     pub run: bool,
     pub run_data: String,
     pub run_data_set: bool,
-    pub run_envs: Vec<String>,
     pub run_timeouts: Vec<String>,
     pub run_cmd: Vec<String>,
     pub run_socket_dirs: Vec<String>,
@@ -179,6 +204,12 @@ pub fn parse(args: &[String], run_mode: bool) -> Result<Options, CliError> {
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
+        // `--x11=trusted` is the only flag with an `=` form.
+        if a == "--x11=trusted" {
+            o.gui = "x11-trusted".into();
+            i += 1;
+            continue;
+        }
         match a {
             "--run" => {
                 o.run = true;
@@ -190,9 +221,29 @@ pub fn parse(args: &[String], run_mode: bool) -> Result<Options, CliError> {
                 i += 2;
             }
             "--env" => {
-                o.run_envs
+                o.envs
                     .push(need(args, i, "--env requires a variable name")?);
                 i += 2;
+            }
+            "--slim" => {
+                o.slim = true;
+                i += 1;
+            }
+            "--no-gui" => {
+                o.gui = "none".into();
+                i += 1;
+            }
+            "--wayland" => {
+                o.gui = "wayland".into();
+                i += 1;
+            }
+            "--x11" => {
+                o.gui = "x11".into();
+                i += 1;
+            }
+            "--full" => {
+                o.full = true;
+                i += 1;
             }
             "--timeout" => {
                 o.run_timeouts
@@ -331,9 +382,8 @@ fn post_parse(o: &mut Options) -> Result<(), CliError> {
         )));
     }
     if !o.run {
-        let run_only: [(&str, bool); 6] = [
+        let run_only: [(&str, bool); 5] = [
             ("data", o.run_data_set),
-            ("env", !o.run_envs.is_empty()),
             ("timeout", !o.run_timeouts.is_empty()),
             ("socket-dir", !o.run_socket_dirs.is_empty()),
             ("no-network", o.run_no_network),
@@ -352,6 +402,19 @@ fn post_parse(o: &mut Options) -> Result<(), CliError> {
         let mut refuse_with = "";
         if o.help_requested {
             refuse_with = "--help";
+        }
+        if o.slim {
+            refuse_with = "--slim";
+        }
+        if o.full {
+            refuse_with = "--full";
+        }
+        if !o.gui.is_empty() {
+            refuse_with = if o.gui == "none" {
+                "--no-gui"
+            } else {
+                "--x11/--wayland"
+            };
         }
         if o.destroy {
             refuse_with = "--destroy";
@@ -420,6 +483,11 @@ fn post_parse(o: &mut Options) -> Result<(), CliError> {
     }
     if (o.stop || o.shutdown || o.migrate) && !o.session.is_empty() && o.sessions.is_empty() {
         o.sessions.push(std::mem::take(&mut o.session));
+    }
+    if o.slim && o.full {
+        return Err(CliError::Usage(Some(
+            "ERROR: --slim and --full are mutually exclusive.".to_string(),
+        )));
     }
     if o.force && !o.stop && !o.shutdown {
         return Err(CliError::Plain(
@@ -502,7 +570,6 @@ mod tests {
     fn run_only_flags_without_run_fail_with_the_probe_line() {
         for flag in [
             "--data x",
-            "--env X",
             "--timeout 3",
             "--socket-dir x",
             "--no-network",
@@ -603,6 +670,45 @@ mod tests {
                 1
             ))
         );
+    }
+
+    #[test]
+    fn image_mode_flags() {
+        // Explicit modes parse, and are mutually exclusive.
+        let o = parse(&v(&["--slim", "s"]), false).unwrap_or_default();
+        assert!(o.slim && !o.full);
+        let o = parse(&v(&["--full", "s"]), false).unwrap_or_default();
+        assert!(o.full && !o.slim);
+        assert!(matches!(
+            parse(&v(&["--slim", "--full", "s"]), false),
+            Err(CliError::Usage(Some(m))) if m.contains("mutually exclusive")
+        ));
+        // --print-images takes the same flag (build parity for the slim refs).
+        let o = parse(&v(&["--print-images", "--slim"]), false).unwrap_or_default();
+        assert!(o.print_images && o.slim);
+        // A run box cannot provision itself, so the mode flags are refused.
+        for flag in ["--slim", "--full"] {
+            let args = v(&["--run", flag, "j", "--", "true"]);
+            assert_eq!(
+                parse(&args, prescan_run(&args)),
+                Err(CliError::Refuse(format!(
+                    "{flag} cannot be combined with --run."
+                )))
+            );
+        }
+    }
+
+    #[test]
+    fn env_is_forwarded_in_both_modes() {
+        // Interactive sessions take --env now; --run still owns its own use.
+        let o = parse(&v(&["--env", "ANTHROPIC_API_KEY", "s"]), false).unwrap_or_default();
+        assert_eq!(o.envs, v(&["ANTHROPIC_API_KEY"]));
+        let o = parse(
+            &v(&["--run", "--env", "A", "--env", "B", "n", "--", "true"]),
+            true,
+        )
+        .unwrap_or_default();
+        assert_eq!(o.envs, v(&["A", "B"]));
     }
 
     #[test]
