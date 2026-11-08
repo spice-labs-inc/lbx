@@ -1,3 +1,4 @@
+==> using llm-in-a-box:docker (full, all capabilities installed)
 ==> Creating new container 's1' (docker) ...
     (forwarding host <HOSTPORT> -> container 8080)
     (forwarding host <HOSTPORT> -> container 3000)

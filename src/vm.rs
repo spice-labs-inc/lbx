@@ -6,7 +6,7 @@
 use crate::config::Resolved;
 use crate::mode::Provision;
 use crate::session::{vm_live_pid_for, vm_sessions_dir};
-use crate::util::{err, out, path_str, realpath_m, which};
+use crate::util::{err, out, path_str, realpath_m, shell_quote, which};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -487,27 +487,6 @@ fn public_keys() -> Vec<String> {
         }
     }
     keys
-}
-
-/// `printf %q` for the seed file: single-quote when needed.
-fn shell_quote(s: &str) -> String {
-    if !s.is_empty()
-        && s.chars().all(|c| {
-            c.is_ascii_alphanumeric()
-                || matches!(c, '.' | '_' | '/' | ':' | '-' | '=' | '+' | ',' | '@' | '%')
-        })
-    {
-        return s.to_string();
-    }
-    if s.contains('\n') {
-        return format!(
-            "$'{}'",
-            s.replace('\\', "\\\\")
-                .replace('\'', "\\'")
-                .replace('\n', "\\n")
-        );
-    }
-    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 pub fn size_bytes(size: &str) -> Option<u64> {
@@ -1036,6 +1015,25 @@ pub fn parse_probe(text: &str) -> (GuiTransport, bool) {
     (marker, state_part.contains("provisioned=no"))
 }
 
+/// The mode the session's base disk was built for. A vm box's image is a
+/// property of its base (`bases/<ts>/provision`), not of a docker label, so an
+/// existing session resolves its image from this stamp instead of the config.
+pub fn session_provision(cfg: &Resolved, session: &str) -> Provision {
+    let base = std::fs::read_to_string(vm_sessions_dir(cfg).join(session).join("base"))
+        .map(|s| s.trim_end_matches('\n').to_string())
+        .unwrap_or_default();
+    if base.is_empty() {
+        return Provision::Full;
+    }
+    let stamp = std::fs::read_to_string(cfg.state_dir.join("bases").join(&base).join("provision"))
+        .unwrap_or_default();
+    if stamp.trim() == "core" {
+        Provision::Core
+    } else {
+        Provision::Full
+    }
+}
+
 /// The cached marker for a session (`bases`-style state under the session dir).
 pub fn gui_cache(cfg: &Resolved, session: &str) -> Option<String> {
     std::fs::read_to_string(vm_sessions_dir(cfg).join(session).join("gui")).ok()
@@ -1436,10 +1434,9 @@ pub fn attach(
     // Credentials and the GUI marker in one ssh exec, before the interactive
     // session: the values are therefore always the host's current ones, and a
     // GUI app installed since the last attach is honoured without a flag.
-    // Retry once: the very first probe can lose a race with the guest's sshd
-    // shortly after boot, and a failed probe used to look exactly like "this
-    // box is already configured" — which silently suppressed the hint on a
-    // fresh box (reported by a user, not by the test that passed here).
+    // Retry once: the first probe can lose a race with the guest's sshd shortly
+    // after boot, and a failed probe is indistinguishable from "this box is
+    // already configured", which would suppress the hint on a fresh box.
     let mut probe = sync_and_probe_gui(&port, host_user, env_forward);
     if !probe.contains("__state__") {
         std::thread::sleep(std::time::Duration::from_secs(1));

@@ -6,6 +6,11 @@ docker
     s1
 
 docker
+    image
+    inspect
+    llm-in-a-box:docker-slim
+
+docker
     inspect
     -f
     {{.State.Status}}
@@ -35,14 +40,14 @@ docker
     llm-in-a-box.runtime=docker
     --label
     llm-in-a-box.user=agent
+    --label
+    llm-in-a-box.provision=full
     -e
     HOST_USER=<USER>
     -e
     HOST_UID=<UID>
     -e
     HOST_GID=<GID>
-    -e
-    GH_TOKEN=baseline-token-value
     -v
     <FIXTURE>/cwd:/data
     -v
@@ -70,6 +75,25 @@ docker
 
 docker
     exec
+    s1
+    sh
+    -c
+    test -x /usr/local/bin/lbx-setup && [ ! -s /home/agent/.lbx/provisioned.log ] && echo fresh
+
+docker
+    exec
+    -i
+    -u
+    <USER>
+    -e
+    HOME=/home/agent
+    s1
+    sh
+    -c
+    umask 077; mkdir -p "$HOME/.lbx"; cat > "$HOME/.lbx/env"
+
+docker
+    exec
     -it
     -e
     HOME=/home/agent
@@ -79,3 +103,4 @@ docker
     gosu
     <USER>
     bash
+

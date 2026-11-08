@@ -124,41 +124,54 @@ echo "== 2b. the OS keychain (safeStorage) really works"
 # is Chromium's documented fallback when no OS keychain is usable (a headless
 # box cannot unlock one: gnome-keyring activates a GTK prompter and leaves the
 # collection locked — measured).
-$SSH_CMD 'grep -q -- "--password-store=gnome-libsecret" /usr/local/bin/open-codesign && echo STORE_ARG_OK' >"$W/keyring.out" 2>&1
-check "the wrapper names the libsecret backend" "grep -q STORE_ARG_OK $W/keyring.out"
 # The real assertion: the SAME Electron build, running a minimal safeStorage
 # probe (tests/fixtures/electron-safestorage-probe), must report a usable store
 # inside this VM — that is exactly what the app needs to save an API key.
-# Use the INSTALLED app's own Electron build, with resources/app.asar swapped
-# for the probe, and the wrapper's bootstrap (a tty-less ssh session has no
-# DBUS_SESSION_BUS_ADDRESS; the daemon and the client must share the bus the
-# wrapper creates — measured: without it, available=false even when the backend
-# is selected).
-cat >"$W/probe-run.sh" <<'PROBE_SCRIPT'
-set -e
-APP=$(readlink -f /usr/bin/open-codesign)
+# The probe replaces the app's own resources, then the wrapper is invoked
+# exactly as a user invokes it (`open-codesign`), so the wrapper's own bootstrap
+# — session bus, keyring unlock, libsecret backend, no-sandbox — is what is
+# under test. The app is restored immediately afterwards, because the next step
+# launches the real app and expects its window.
+cat >"$W/probe-prep.sh" <<'PREP'
+# No `set -e`, and every step names its own failure: a probe that cannot start
+# must say why rather than print nothing.
+set -u
+APP=$(readlink -f /usr/bin/open-codesign 2>/dev/null)
+[ -n "$APP" ] && [ -x "$APP" ] || APP=/opt/open-codesign/open-codesign
 DIR=$(dirname "$APP")
-D=/tmp/ocd-probe
-rm -rf "$D"; cp -a "$DIR/." "$D/"
-rm -rf "$D/resources/app.asar" "$D/resources/app"
-cp -a /tmp/safestorage-probe "$D/resources/app"
-if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
-    exec dbus-run-session -- sh "$0"
+echo "prep: app=$APP dir=$DIR"
+[ -x "$APP" ] || { echo "prep: no executable app binary at $APP"; exit 1; }
+[ -d "$DIR/resources" ] || { echo "prep: no resources directory in $DIR"; exit 1; }
+SUDO=""; [ "$(id -u)" = "0" ] || SUDO="sudo -n"
+if [ -e "$DIR/resources/app.asar" ]; then
+    $SUDO mv "$DIR/resources/app.asar" /tmp/app.asar.bak || { echo "prep: cannot set aside app.asar"; exit 1; }
 fi
-eval "$(printf '\n' | gnome-keyring-daemon --unlock --components=secrets 2>/dev/null)" || true
-exec "$D/$(basename "$APP")" --no-sandbox --password-store=gnome-libsecret
-PROBE_SCRIPT
+$SUDO rm -rf "$DIR/resources/app"
+$SUDO cp -a /tmp/safestorage-probe "$DIR/resources/app" || { echo "prep: cannot install the probe"; exit 1; }
+echo "prep: probe installed in place"
+PREP
 scp -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P "$PORT" -r \
     "$ROOT/tests/fixtures/electron-safestorage-probe" "$USER@127.0.0.1:/tmp/safestorage-probe" >/dev/null 2>&1
 scp -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P "$PORT" \
-    "$W/probe-run.sh" "$USER@127.0.0.1:/tmp/probe-run.sh" >/dev/null 2>&1
-DISPLAY=":$DISPLAY_NUM" timeout 240 $SSH_CMD -X 'sh /tmp/probe-run.sh 2>/dev/null | grep PROBE' >"$W/probe.out" 2>&1
-echo "   probe: $(cat "$W/probe.out" 2>/dev/null | head -1)"
-check "safeStorage is available in the box (probe: available=true)" "grep -q 'available=true' $W/probe.out"
+    "$W/probe-prep.sh" "$USER@127.0.0.1:/tmp/probe-prep.sh" >/dev/null 2>&1
+DISPLAY=":$DISPLAY_NUM" timeout 300 $SSH_CMD -X \
+    'echo "guest DISPLAY=${DISPLAY:-<unset>}"; sh /tmp/probe-prep.sh; echo "prep rc=$?"; \
+     timeout 150 open-codesign; echo "wrapper rc=$?"; \
+     APP=$(readlink -f /usr/bin/open-codesign); DIR=$(dirname "$APP"); \
+     SUDO=""; [ "$(id -u)" = "0" ] || SUDO="sudo -n"; \
+     $SUDO rm -rf "$DIR/resources/app"; \
+     [ -e /tmp/app.asar.bak ] && $SUDO mv /tmp/app.asar.bak "$DIR/resources/app.asar"; \
+     echo "restored rc=$?"' \
+    >"$W/probe.out" 2>&1
+sed 's/^/   probe: /' "$W/probe.out" | tail -8
+check "safeStorage is available through the installed wrapper (probe: available=true)" \
+    "grep -q 'available=true' $W/probe.out"
 check "and the probe round-trips a secret" "grep -q 'roundtrip=true' $W/probe.out"
 check "with the libsecret backend" "grep -q 'backend=gnome_libsecret' $W/probe.out"
-check "the wrapper is installed in /usr/local/bin" "$SSH_CMD 'test -x /usr/local/bin/open-codesign'"
-check "the wrapper names a real app binary" "$SSH_CMD 'grep -q \"/opt/open-codesign\|open-codesign\" /usr/local/bin/open-codesign && ! grep -q \"exec /usr/local/bin\" /usr/local/bin/open-codesign'"
+# A gate, not the end claim: without the wrapper on PATH the probe below cannot
+# run, and naming it here says why.
+check "the wrapper is installed in /usr/local/bin (gate for the probe)" \
+    "$SSH_CMD 'test -x /usr/local/bin/open-codesign'"
 
 echo ""
 echo "== 2c. the system browser the exporters need"
@@ -191,7 +204,7 @@ echo "== 3. it renders on the HOST's X server through ssh -X"
 # ssh does not return even after the shell exits (measured: the first version
 # hung here forever). So: bound the session with `timeout`, and kill the app
 # from inside once the client has been observed.
-APP_CMD='cd /data; (nohup env LIBGL_ALWAYS_SOFTWARE=1 open-codesign --no-sandbox >/tmp/ocd.log 2>&1 &); for i in $(seq 1 25); do sleep 1; done; pkill -f "opt/open-codesign" 2>/dev/null; true'
+APP_CMD='echo "guest DISPLAY=${DISPLAY:-<unset>}"; cd /data; (nohup env LIBGL_ALWAYS_SOFTWARE=1 open-codesign --no-sandbox >/tmp/ocd.log 2>&1 &); for i in $(seq 1 25); do sleep 1; done; pkill -f "opt/open-codesign" 2>/dev/null; true'
 DISPLAY=":$DISPLAY_NUM" timeout 60 $SSH_CMD -X "$APP_CMD" >"$W/app.log" 2>&1 &
 APP_SSH=$!
 sleep 14

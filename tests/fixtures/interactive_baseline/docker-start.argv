@@ -48,6 +48,13 @@ docker
 
 docker
     exec
+    s1
+    sh
+    -c
+    test -x /usr/local/bin/lbx-setup && [ ! -s /home/agent/.lbx/provisioned.log ] && echo fresh
+
+docker
+    exec
     -it
     -e
     HOME=/home/agent

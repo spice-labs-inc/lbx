@@ -206,3 +206,34 @@ Two test-harness facts that are easy to get wrong:
   creates the replacement as the box user, so the suite chowns its scratch tree
   to that user first. Production never sees this: the state directory belongs to
   the invoking user.
+
+## Export path
+
+`export_box` (src/migrate.rs) reads `/proc/<pid>/root/home/agent` as root and
+archives it with `tar --numeric-owner`. Constraints that the implementation
+must keep:
+
+- The pid must be live: `box_pid()` polls `docker inspect -f {{.State.Pid}}`
+  because a sysbox container reports `0` for a moment after `docker start`; the
+  export waits up to 10 s, a `docker start` up to 20 s.
+- The archive is retried once with a freshly read pid: a container restarted by
+  its runtime mid-archive changes the per-entry `/proc/<pid>/root` resolution
+  and fails the tar on a box that is healthy again by the time anyone looks.
+- On failure, the archive tool's stderr is printed (`tar: <line>`): an
+  unreadable entry, a full disk and a stale `/proc` path are indistinguishable
+  in the caller's message alone.
+- Both `MIGRATE_HOME` and `LEGACY_HOME` are tried, current first, because a box
+  created by the older launcher holds its home at the legacy path.
+- When the box cannot be started at all (sysbox-fs "already pre-registered" after
+  a daemon restart) or dies mid-archive, the export falls back to
+  `docker export <name> | tar -x -C <work>/fs home/agent`, then tars that
+  directory. Constraints: `docker export` names members **without** a leading
+  slash (`home/agent/…`) while `tar -x` refuses an absolute member, so the
+  leading slash is stripped (`extract_export_member`); the whole rootfs is
+  streamed and only the home directory kept; ids in that stream are irrelevant
+  because `restore_box` uses `--no-same-owner` and then chowns to the box user;
+  the work directory is removed on both paths because the stream can be
+  gigabytes. Covered by the unit test
+  `an_export_stream_extracts_its_home_member` in `src/migrate.rs`.
+- No `docker exec` is used: on a damaged box it is exactly what stops working.
+

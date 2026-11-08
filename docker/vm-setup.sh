@@ -194,8 +194,9 @@ chmod 700 "$SSH_DIR" 2>/dev/null || true
 # ── 4a. Host-forwarded variables (`lbx --env` / `env.forward`) ─────────────
 # The launcher writes ~/.lbx/env (mode 0600, owned by the box user) over ssh
 # before every attach, with the host's current values — so a rotated key is
-# picked up on the next `lbx`, a removed variable disappears, and a container
-# box behaves identically (where the values ride the exec instead of a file).
+# picked up on the next `lbx`, a removed variable disappears. A container box
+# writes the same file over `docker exec -i` stdin and sources it from the same
+# hook, so both runtimes deliver the variables the same way.
 # This unit only installs the hook that sources it; it never writes secrets.
 USER_HOME="$(getent passwd "$TARGET_UID" | cut -d: -f6)"
 USER_HOME="${USER_HOME:-/home/agent}"

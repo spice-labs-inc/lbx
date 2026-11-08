@@ -230,7 +230,16 @@ fn main() {
         ));
     }
 
-    // Runtime resolution.
+    // Runtime resolution. The lookup is one docker/vm query and its answer
+    // already carries the image, so nothing below probes a container again —
+    // the interactive baseline pins the exact calls a launch makes.
+    // Only a launch needs it; --destroy/--stop do their own probing and a
+    // second state query would show up in their recorded calls.
+    let lookup = if o.destroy || o.stop || o.shutdown {
+        session::Lookup::Missing
+    } else {
+        session::session_lookup(&cfg, &o.session)
+    };
     let mut runtime = o.runtime.clone();
     if o.destroy || o.stop || o.shutdown {
         if !runtime.is_empty() && !matches!(runtime.as_str(), "sysbox" | "docker" | "vm") {
@@ -246,7 +255,7 @@ fn main() {
             ));
             std::process::exit(1);
         }
-        match session::session_lookup(&cfg, &o.session) {
+        match &lookup {
             session::Lookup::Ambiguous(rts) => {
                 if !rts.contains(&runtime) {
                     err(&format!(
@@ -263,7 +272,7 @@ fn main() {
             session::Lookup::Missing => {}
             session::Lookup::Found(c) => {
                 if runtime != c.runtime {
-                    let rt = c.runtime;
+                    let rt = c.runtime.clone();
                     err(&format!(
                         "ERROR: session '{}' already exists as a {rt} instance.",
                         o.session
@@ -281,7 +290,7 @@ fn main() {
             }
         }
     } else {
-        match session::session_lookup(&cfg, &o.session) {
+        match &lookup {
             session::Lookup::Ambiguous(rts) => {
                 err(&format!(
                     "ERROR: session '{}' exists in multiple runtimes ({}).",
@@ -336,33 +345,28 @@ fn main() {
         ));
     }
 
-    // Image mode (full | slim) for this launch. Nothing above needed an image:
-    // destroy/stop/list exit earlier.
-    //
-    // An EXISTING box keeps the image it was built from. Attaching to, or
-    // starting, a box must never depend on the image that this invocation
-    // would have created (you can launch a stopped slim box without having
-    // built the slim image again, and without --slim).
-    let existing = if runtime == "vm" {
-        session::vm_state_for(&cfg, &o.session) != "missing"
-    } else {
-        Docker::container_fmt(&o.session, "{{.Config.Image}}").is_some()
-    };
-    let (image, provision) = match lbx::mode::resolve(&cfg, &runtime, o.slim, o.full) {
-        Ok(v) => v,
-        Err(_m) if existing => {
-            let img = Docker::container_fmt(&o.session, "{{.Config.Image}}").unwrap_or_default();
-            let prov = lbx::mode::Provision::from_label(&Docker::container_label(
-                &o.session,
-                lbx::mode::LABEL,
-            ))
-            .unwrap_or(lbx::mode::Provision::Full);
-            (img, prov)
+    // Image mode (full | slim). Only a NEW box needs one: an existing box keeps
+    // the image it was created from, so attaching or starting it must not depend
+    // on the mode of this invocation (and must not add docker calls or print a
+    // line the interactive baseline does not have).
+    let (image, provision) = match &lookup {
+        session::Lookup::Found(c) if c.runtime == "vm" => {
+            let p = lbx::vm::session_provision(&cfg, &o.session);
+            (lbx::mode::image_ref(&cfg, "vm", p), p)
         }
-        Err(m) => {
-            err(&m);
-            std::process::exit(1);
+        // The mode label is only written on create, so an existing container
+        // does not need to be asked about it (one fewer docker call, which the
+        // interactive baseline pins).
+        session::Lookup::Found(c) if !c.image.is_empty() => {
+            (c.image.clone(), lbx::mode::Provision::Full)
         }
+        _ => match lbx::mode::resolve(&cfg, &runtime, o.slim, o.full) {
+            Ok(v) => v,
+            Err(m) => {
+                err(&m);
+                std::process::exit(1);
+            }
+        },
     };
     let env_forward = collect_env_forward(&o, &cfg);
     if runtime == "vm" {

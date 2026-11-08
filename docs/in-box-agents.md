@@ -72,7 +72,11 @@ A slim box has nothing installed, so the first attach says so — once:
 A hint rather than a prompt: attach is scriptable (`lbx s && claude -p …`), and
 a blocking TUI there would break that. The condition is the provisioning log
 the steps write, so a configured box is never nagged again, and a full image
-(which has the log from build time) never sees it.
+(which has the log from build time) never sees it. The decision falls back to
+the resolved image mode when the probe cannot answer, so a fresh slim box is
+never mistaken for a configured one — verified by
+`tests/verify-vm-slim-e2e.sh` ("a fresh slim box is told how to set it up",
+"and names the command to run", "a configured box is not nagged again").
 
 ### Optional steps that need a display (vm only)
 
@@ -85,14 +89,33 @@ session you install in cannot have one. After the re-attach the launcher prints
 `==> GUI app in this box: forwarding x11`, and the marker survives a
 `--shutdown`/resume.
 
+The install is verified end to end by `tests/verify-vm-design-e2e.sh`, which
+boots a virtual machine and checks: the release asset resolves, the step
+succeeds, the package and launcher wrapper are installed, the keychain probe
+reports a usable store **through the wrapper**
+(`safeStorage is available through the installed wrapper`), a browser the
+application's own rule finds is a real Google Chrome and not the Ubuntu snap
+stub, a headless print produces a valid PDF with the application's arguments,
+the window appears on the host's X server, the virtual machine shuts down and
+resumes, and the application still renders afterwards. The checklist itself is
+covered by `tests/test_lbx_setup_ui.sh` (a `dialog` that cannot initialise
+curses falls back to the plain menu; a chosen step runs; cancel is not a
+failure; `--list` needs no curses).
+
 ### Model credentials from the host
 
 `lbx` forwards the host variables named in `env.forward` (default `GH_TOKEN`)
 into an interactive box, and `--env NAME` adds or replaces one for a session.
 Only the names are printed, never the values. The values are passed at
-**attach** time — `docker exec` on containers, `~/.lbx/env` over ssh on the vm
-— so `docker inspect` never contains a token and a rotated key takes effect on
-the next `lbx`.
+**attach** time as the file `~/.lbx/env` (0600, owned by the box user) — written
+over stdin for a container and over ssh for the vm — and the box user's shell
+sources it. So no value is in any `docker exec` or `docker run` argument vector
+(where `ps` would show it), `docker inspect` never contains a token, and a
+rotated key takes effect on the next `lbx`.
+
+The set of variables actually forwarded is verified behaviourally by
+`tests/test_llm_in_a_box_vm_gui.sh` ("the default forward list carries
+GH_TOKEN", "and carries no model key unless one is asked for").
 
 The agents read those variables from the environment, so no in-box
 configuration file is generated: Claude Code takes `ANTHROPIC_API_KEY`, Pi and

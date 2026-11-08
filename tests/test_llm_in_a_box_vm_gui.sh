@@ -12,15 +12,18 @@
 #     never blocks the attach;
 #   * credentials travel at attach time (the ssh payload), never in the image
 #     seed, and `docker run -e` never carries them;
-#   * a real vm preflight runs (qemu + qemu-img + ssh present, accel=tcg so no
-#     KVM is needed; a real qcow2 base so the format check is real).
+#   * the launcher's vm preflight runs: it needs a qemu binary, a base disk whose
+#     format it can read, and ssh. Those are exercised against a real qemu-img
+#     when the host has one, and against stand-ins otherwise, so this suite runs
+#     on a host with no qemu at all.
 #
 # It does not boot a VM: the transport decision is pure argv, and a boot is
 # covered by tests/verify-vm-e2e.sh on a host with KVM.
 #
-# Preconditions (qemu-system-x86_64, qemu-img) are checked before any check
-# line is emitted, so a host without them reports "SKIP:" and zero checks —
-# nothing is silently skipped inside the run.
+# qemu is not a precondition: the transport decision is argv, and the preflight
+# only needs a qemu binary on PATH and a base disk whose format it can read, so
+# stand-ins are supplied when the host has neither. A suite that emitted no
+# checks on the CI runner would be a suite that proves nothing there.
 #
 # Usage: bash tests/test_llm_in_a_box_vm_gui.sh
 #   LBX_BIN=<path>   launcher under test (default: target/debug/lbx)
@@ -31,8 +34,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 LBX="${LBX_BIN:-$ROOT/target/debug/lbx}"
 [ -x "$LBX" ] || { echo "ERROR: no lbx binary at $LBX (cargo build first)." >&2; exit 1; }
-command -v qemu-system-x86_64 >/dev/null || { echo "SKIP: qemu-system-x86_64 not installed"; exit 0; }
-command -v qemu-img >/dev/null || { echo "SKIP: qemu-img not installed"; exit 0; }
+# Stand-ins for a host without qemu. They answer the two questions the
+# launcher asks — "is there a qemu binary" and "what format is this disk" — and
+# nothing else; a host that has the real ones uses them.
+QEMU_REAL=1
+command -v qemu-system-x86_64 >/dev/null || { QEMU_REAL=0; }
+command -v qemu-img >/dev/null || { QEMU_REAL=0; }
 
 PASS=0
 FAIL=0
@@ -46,6 +53,22 @@ check() {
 }
 
 W="$(mktemp -d /tmp/lbx-gui-test.XXXXXX)"
+if [ "$QEMU_REAL" = 0 ]; then
+    mkdir -p "$W/bin"
+    cat >"$W/bin/qemu-img" <<'SHIM'
+#!/bin/sh
+case "$1" in
+    info) printf 'image: x\nfile format: qcow2\nvirtual size: 1.0M\n' ;;
+    create) shift 3; : >"$1"; printf 'QFQ\0' >>"$1" ;;
+esac
+exit 0
+SHIM
+    printf '#!/bin/sh\nexit 0\n' >"$W/bin/qemu-system-x86_64"
+    chmod +x "$W/bin/qemu-img" "$W/bin/qemu-system-x86_64"
+    PATH="$W/bin:$PATH"
+    export PATH
+fi
+
 trap 'rm -rf "$W"' EXIT
 
 # ── shims ──────────────────────────────────────────────────────────────────
@@ -164,8 +187,15 @@ LBX_GUI_MARKER= ANTHROPIC_API_KEY=sk-test-1 "$LBX" --env ANTHROPIC_API_KEY "$SES
 check "--env NAME reaches the box over the attach probe" \
     "grep -q \"export ANTHROPIC_API_KEY=sk-test-1\" $LBX_SSH_STDIN_LOG"
 check "--env NAME is not printed" "! grep -q 'sk-test-1' $W/out $W/err"
-check "the default forward list is GH_TOKEN only" \
-    "grep -q 'DEFAULT_ENV_FORWARD: &str = \"GH_TOKEN\"' '$ROOT/src/config.rs'"
+# Behaviour, not the source: start a session with several host credentials set
+# and no --env. Only GH_TOKEN is in the default forward list, so the payload the
+# attach probe writes into the box may mention GH_TOKEN and must not mention a
+# model key.
+run_lbx LBX_GUI_MARKER= GH_TOKEN=gh-default-test ANTHROPIC_API_KEY=sk-default-test
+check "the default forward list carries GH_TOKEN" \
+    "grep -q 'export GH_TOKEN=gh-default-test' $LBX_SSH_STDIN_LOG"
+check "and carries no model key unless one is asked for" \
+    "! grep -q ANTHROPIC_API_KEY $LBX_SSH_STDIN_LOG"
 
 # ── 9. a stale marker is cleared when the app goes away ───────────────────
 printf 'transport=x11\n' >"$SDIR/gui"

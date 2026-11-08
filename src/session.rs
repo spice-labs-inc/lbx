@@ -65,6 +65,11 @@ pub fn vm_state_for(cfg: &Resolved, name: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerSession {
     pub runtime: String,
+    /// The image the container was created from. It is already part of the
+    /// state query, so a launch that needs "which image is this box?" never
+    /// makes a second `docker container inspect` (the interactive baseline
+    /// pins the calls: adding one showed up as a regression).
+    pub image: String,
     pub state: String,
     pub legacy: bool,
 }
@@ -111,6 +116,7 @@ pub fn container_session_state(name: &str) -> Option<ContainerSession> {
     }
     Some(ContainerSession {
         runtime: rt,
+        image: img,
         state,
         legacy,
     })
@@ -136,6 +142,10 @@ pub fn session_lookup(cfg: &Resolved, name: &str) -> Lookup {
     let vm = if vm_sessions_dir(cfg).join(name).is_dir() {
         Some(ContainerSession {
             runtime: "vm".into(),
+            // A vm session's image is in its base disk's provenance, not in a
+            // docker label; left empty here and resolved from the base when a
+            // launch needs it.
+            image: String::new(),
             state: vm_state_for(cfg, name),
             legacy: false,
         })
@@ -563,13 +573,6 @@ pub struct Launch<'a> {
     pub net_policy: String,
 }
 
-impl Launch<'_> {
-    /// The image mode as a typed value (the struct carries the label).
-    fn provision_mode(&self) -> crate::mode::Provision {
-        crate::mode::Provision::from_label(&self.provision).unwrap_or(crate::mode::Provision::Full)
-    }
-}
-
 fn wait_for_running(session: &str) -> bool {
     for _ in 0..30 {
         if Docker::state(session).as_deref() == Some("running") {
@@ -647,28 +650,62 @@ pub fn slim_hint() {
 }
 
 /// True when this box needs the hint: `lbx-setup` present, nothing recorded.
-/// `provision` is the resolved image's mode, used when the probe fails: a
-/// failed `docker exec` must not be mistaken for "already configured".
-fn needs_slim_hint(session: &str, provision: crate::mode::Provision) -> bool {
-    match Docker::line(&[
+fn needs_slim_hint(session: &str) -> bool {
+    Docker::line(&[
         "exec",
         session,
         "sh",
         "-c",
         "test -x /usr/local/bin/lbx-setup && [ ! -s /home/agent/.lbx/provisioned.log ] && echo fresh",
-    ]) {
-        Some(l) => l.trim() == "fresh",
-        None => provision == crate::mode::Provision::Core,
+    ])
+    .is_some_and(|l| l.trim() == "fresh")
+}
+
+/// Hand the forwarded variables to the box as the box user, over stdin.
+///
+/// `umask 077` and a file in `~/.lbx` (which the image owns) mean the values are
+/// readable only by the box user, and `cat >` means no value is ever an
+/// argument: `docker exec -i … cat > file` carries the payload on stdin, which
+/// `ps` does not show. The image's shell hook sources the file.
+fn write_env_file(session: &str, user: &str, env_forward: &[(String, String)]) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut payload = String::new();
+    for (name, value) in env_forward {
+        payload.push_str(&format!(
+            "export {name}={}\n",
+            crate::util::shell_quote(value)
+        ));
     }
+    let child = Command::new("docker")
+        .args([
+            "exec",
+            "-i",
+            "-u",
+            user,
+            "-e",
+            "HOME=/home/agent",
+            session,
+            "sh",
+            "-c",
+            "umask 077; mkdir -p \"$HOME/.lbx\"; cat > \"$HOME/.lbx/env\"",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    let Ok(mut child) = child else {
+        return false;
+    };
+    let written = child
+        .stdin
+        .take()
+        .is_some_and(|mut w| w.write_all(payload.as_bytes()).is_ok());
+    written && child.wait().is_ok_and(|s| s.success())
 }
 
 /// Attach: exec into the box (replaces this process on success).
-fn attach_session(
-    session: &str,
-    host_user: &str,
-    env_forward: &[(String, String)],
-    provision: crate::mode::Provision,
-) -> i32 {
+fn attach_session(session: &str, host_user: &str, env_forward: &[(String, String)]) -> i32 {
     use std::os::unix::process::CommandExt;
     for _ in 0..30 {
         if Docker::quiet(&["exec", session, "test", "-f", "/tmp/.user-ready"]) {
@@ -685,33 +722,33 @@ fn attach_session(
     }
     out("");
     out("  Welcome to llm in a box... where agents are constrained");
-    if needs_slim_hint(session, provision) {
+    if needs_slim_hint(session) {
         slim_hint();
     }
     out("");
-    // Credentials (and anything else `--env`/`env.forward` names) are passed
-    // on the EXEC, not at `docker run`: exec env is not stored in the
-    // container's config, so `docker inspect` never shows a token, a rotated
-    // key is picked up on the next attach, and the values disappear with the
-    // session instead of outliving it.
-    let mut argv: Vec<String> = vec![
+    // Credentials (and anything else `--env`/`env.forward` names) reach the box
+    // as a file the box user owns, written over stdin before the attach — not
+    // as `-e NAME=VALUE` on the exec. Two properties follow: no value is in any
+    // argument vector (`ps` on the host shows every argv to every local user),
+    // and no value is stored in the container's config, so `docker inspect`
+    // never shows a token and a rotated key is picked up on the next attach.
+    // The image sources the file from the box user's shell, which is how the vm
+    // path delivers the same variables.
+    if !env_forward.is_empty() && !write_env_file(session, &exec_user, env_forward) {
+        err("WARNING: could not hand the forwarded variables to the box");
+    }
+    let argv: Vec<String> = vec![
         "exec".into(),
         "-it".into(),
         "-e".into(),
         "HOME=/home/agent".into(),
-    ];
-    for (name, value) in env_forward {
-        argv.push("-e".into());
-        argv.push(format!("{name}={value}"));
-    }
-    argv.extend([
         "-w".to_string(),
         "/data".to_string(),
         session.to_string(),
         "gosu".to_string(),
         exec_user.clone(),
         "bash".to_string(),
-    ]);
+    ];
     let e = std::process::Command::new("docker").args(&argv).exec();
     err(&format!("ERROR: could not exec docker: {e}"));
     1
@@ -765,7 +802,7 @@ pub fn launch(l: &Launch) -> i32 {
             out(&format!(
                 "==> Attaching to running container '{session}' ({runtime}) ..."
             ));
-            attach_session(session, &l.host_user, &l.env_forward, l.provision_mode())
+            attach_session(session, &l.host_user, &l.env_forward)
         }
         "exited" | "created" => {
             let stamp = Docker::container_label(session, "llm-in-a-box.user");
@@ -798,7 +835,7 @@ pub fn launch(l: &Launch) -> i32 {
                 sysbox_box_damage_report(session);
                 return 1;
             }
-            attach_session(session, &l.host_user, &l.env_forward, l.provision_mode())
+            attach_session(session, &l.host_user, &l.env_forward)
         }
         "missing" => create(l),
         other => {
@@ -1027,7 +1064,7 @@ fn create(l: &Launch) -> i32 {
     if !wait_for_running(session) {
         return 1;
     }
-    attach_session(session, &l.host_user, &l.env_forward, l.provision_mode())
+    attach_session(session, &l.host_user, &l.env_forward)
 }
 
 /// Extra lines for a failed `docker run` of a new box, keyed on the daemon's

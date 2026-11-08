@@ -44,6 +44,11 @@ baseline_fixture() {
     : > "$root/argv"
     printf '%s\n' llm-in-a-box:docker llm-in-a-box:sysbox llm-in-a-box-relay:latest > "$root/exist"
     printf '{"mode":"enforce","allow":["api.anthropic.com"],"block":[]}\n' > "$root/policy.json"
+    # The sysbox scenario needs the FUSE mount helper present; the launcher
+    # refuses a sysbox create without it, and the scenario pins argv shape, not
+    # whether this host runs sysbox.
+    printf '#!/bin/sh\nexit 0\n' > "$root/bin/fusermount3"
+    chmod +x "$root/bin/fusermount3"
 }
 
 # Run the launcher inside a fixture. Arguments after the fixture root are

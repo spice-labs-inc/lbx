@@ -365,11 +365,13 @@ deliberate pins: Bun (OMP dep), Gradle, sysbox docker-ce/containerd.
 
 ### Image modes (full | slim)
 
-- `--target slim` builds `llm-in-a-box:<runtime>-slim`: Ubuntu + box user +
+- The Dockerfile's `slim` stage (built by `./build --slim <runtime>`) produces
+  `llm-in-a-box:<runtime>-slim`: Ubuntu + box user +
   entrypoint + docker + node + gh + CLI tools + `dialog` + `lbx-setup` +
   `/opt/llm-in-a-box/provision.d/`. No Rust/JVM/Emacs/Ansible/agents.
-- `--target full` builds `llm-in-a-box:<runtime>` **FROM** the slim image and
-  runs every provisioning step. Same contents as the pre-split image; the
+- The `full` stage (built by `./build --full <runtime>`, the default) produces
+  `llm-in-a-box:<runtime>` **FROM** the slim image and runs every provisioning
+  step. Same contents as the pre-split image; the
   steps moved into `docker/provision.d/` (single definition of "installed").
 - `./build all` builds both, slim first (the parent-image dependency, not a
   build cache — works with `--no-cache`). `./build --slim all` = slim only;

@@ -204,15 +204,50 @@ as_root() {
 wait_box_ready() {
     local name="$1" i
     for i in $(seq 1 90); do
-        docker exec "$name" test -f /tmp/.user-ready >/dev/null 2>&1 && return 0
+        if docker exec "$name" test -f /tmp/.user-ready >/dev/null 2>&1; then
+            # The entrypoint writes /tmp/.user-ready before it finishes its
+            # home-ownership pass, and on a cold fat image that pass can outlast
+            # a short exec: a box that is "ready" by that marker can still fail
+            # to answer a root exec for a while. Wait for one answer, so a check
+            # that only needs a working box does not fail on a slow start.
+            for _ in $(seq 1 90); do
+                timeout 5 docker exec -u 0 "$name" true >/dev/null 2>&1 && return 0
+                sleep 1
+            done
+            return 1
+        fi
         sleep 1
     done
     return 1
 }
 
+# A root exec that cannot stall the pass. A box whose ID mapping is gone can make
+# the runtime block `docker exec -u 0` forever (uid 0 has no mapping to resolve),
+# and an unbounded exec turned one damaged box into a five-minute stall per call.
+# Bounded here, a box in that state fails the check that needed the exec and the
+# pass moves on.
+EXEC_TIMEOUT="${LBX_EXEC_TIMEOUT:-60}"
+root_exec() {
+    timeout "$EXEC_TIMEOUT" root_exec "$@"
+}
+
+# An exec as the box user: the form that answers whether or not the box's ID
+# mapping survived, so setup steps and checks that must run on a damaged box use
+# this rather than a root exec.
+box_user_exec() {
+    timeout "$EXEC_TIMEOUT" docker exec -u "$BOX_UID:$BOX_GID" "$@"
+}
+
 # The box's own view of a file's owner (uid gid mode).
 box_stat() {
-    docker exec -u 0 "$1" stat -c '%u %g %a' "$2" 2>/dev/null | head -1
+    local out
+    out="$(root_exec "$1" stat -c '%u %g %a' "$2" 2>/dev/null | head -1)"
+    [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+    # A root exec into a damaged box can block in the runtime (uid 0 has no
+    # mapping to resolve), so a read as the BOX USER is the fallback: the ids it
+    # reports are the box's own view either way.
+    timeout "$EXEC_TIMEOUT" docker exec -u "$BOX_UID:$BOX_GID" "$1" \
+        stat -c '%u %g %a' "$2" 2>/dev/null | head -1
 }
 
 # The host's view of the same file, through the container's root mount.
@@ -263,15 +298,18 @@ migrate_real() {
 # directories as needed.
 box_write_as_user() {
     local name="$1" path="$2" content="$3"
-    docker exec -u 0 "$name" bash -c \
-        "mkdir -p \"\$(dirname '$path')\" && printf '%s\n' '$content' > '$path' && chown -R $BOX_UID:$BOX_GID \"\$(dirname '$path')\"" \
+    # Written AS the box user: the file lands in their own home, so no chown is
+    # needed, and this exec form answers even when a root exec is blocked by the
+    # state the suite is about to measure.
+    box_user_exec "$name" bash -c \
+        "mkdir -p \"\$(dirname '$path')\" && printf '%s\n' '$content' > '$path'" \
         >/dev/null 2>&1
 }
 
 # Read a file as the box user. Prints nothing and returns non-zero when the
 # box user cannot read it, which is the failure mode under test.
 box_read_as_user() {
-    docker exec -u "$BOX_UID:$BOX_GID" "$1" cat "$2" 2>/dev/null
+    box_user_exec "$1" cat "$2" 2>/dev/null
 }
 
 # The state of each sysbox unit, on one line.
@@ -317,7 +355,7 @@ wait_box_running() {
 wait_box_exec() {
     local name="$1" deadline=$((SECONDS + $2))
     while [ "$SECONDS" -lt "$deadline" ]; do
-        docker exec -u 0 "$name" true >/dev/null 2>&1 && return 0
+        root_exec "$name" true >/dev/null 2>&1 && return 0
         sleep 1
     done
     return 1
@@ -348,9 +386,17 @@ damage_box() {
 # uid: the box sees 65534 65534 where the host sees 0 0. This is the ground
 # truth the migration must survive, and both halves are measured, not assumed.
 box_is_damaged() {
-    local name="$1"
-    [ "$(box_stat "$name" /etc/sudo.conf)" = "65534 65534 644" ] \
-        && [ "$(host_stat "$name" /etc/sudo.conf)" = "0 0 644" ]
+    local name="$1" box host
+    box="$(box_stat "$name" /etc/sudo.conf)"
+    host="$(host_stat "$name" /etc/sudo.conf)"
+    # The HOST's view is decisive and cannot wedge: a healthy box's
+    # /etc/sudo.conf is owned by the session's id range (measured 231072 231072
+    # on this stack) and a damaged one by host root (0 0). The box's own view
+    # (65534 65534) is a second witness when it answers; a root exec into a
+    # damaged box can block in the runtime, so requiring it made the check
+    # depend on the very failure it is measuring.
+    [ "$host" = "0 0 644" ] || return 1
+    [ -z "$box" ] || [ "$box" = "65534 65534 644" ]
 }
 
 # What a box looked like, for the log when a check fails.
@@ -369,10 +415,12 @@ damage_box_confirmed() {
     for try in 1 2 3; do
         damage_box "$name"
         t0=$SECONDS
-        if wait_box_exec "$name" 60; then
+        # Recorded, not required: a root exec into a damaged box may block in the
+        # runtime, and the damage is decided from the host's view.
+        if wait_box_exec "$name" 30; then
             exec_note="docker exec answered after $((SECONDS - t0))s"
         else
-            exec_note="docker exec did not answer within 60s"
+            exec_note="docker exec did not answer within 30s"
         fi
         box_is_damaged "$name" && return 0
         DAMAGE_REPORT="$DAMAGE_REPORT    try $try: $DAMAGE_WAITS, $exec_note
@@ -563,7 +611,7 @@ if [ "$MIG6_READY" = true ]; then
         # NOT carried across, because they live in the container's root
         # filesystem and not in the home directory, and that claim had no check
         # (adversarial review, 2026-10-18). This is what makes it testable.
-        docker exec -u 0 "$MIG_BOX" bash -c \
+        root_exec "$MIG_BOX" bash -c \
             'mkdir -p /opt/lbx-pkg && echo installed > /opt/lbx-pkg/marker' >/dev/null 2>&1 || true
 
         # Damage it exactly as the field boxes are damaged, and confirm the
@@ -587,7 +635,7 @@ if [ "$MIG6_READY" = true ]; then
         MIG6_OWNED=false
         [ "$(box_stat "$MIG_BOX" /home/agent/.pi/agent/sessions/--home-agent--/sess-e2e.jsonl)" = "$BOX_UID $BOX_GID 644" ] && MIG6_OWNED=true
         MIG6_USERNS=false
-        docker exec -u 0 "$MIG_BOX" sh -c 'grep -q "^ *0 " /proc/self/uid_map' >/dev/null 2>&1 && MIG6_USERNS=true
+        box_user_exec "$MIG_BOX" sh -c 'grep -q "^ *0 " /proc/self/uid_map' >/dev/null 2>&1 && MIG6_USERNS=true
         MIG6_SUDO=false
         box_sudo_works "$MIG_BOX" && MIG6_SUDO=true
         MIG6_POST_READ="$(box_read_as_user "$MIG_BOX" /home/agent/.pi/agent/sessions/--home-agent--/sess-e2e.jsonl)"
@@ -638,7 +686,7 @@ if [ "$MIG6_READY" = true ]; then
         # box is healthy here, so this is not "exec is broken": the path is
         # simply absent.
         MIG6_PKG_GONE=false
-        docker exec -u 0 "$MIG_BOX" test -e /opt/lbx-pkg/marker >/dev/null 2>&1 || MIG6_PKG_GONE=true
+        root_exec "$MIG_BOX" test -e /opt/lbx-pkg/marker >/dev/null 2>&1 || MIG6_PKG_GONE=true
         check "MIG6 the migration does not carry packages installed outside the home directory" \
             "[ \"\$MIG6_PKG_GONE\" = true ]"
 
@@ -737,7 +785,14 @@ if [ "$MIG6_READY" = true ]; then
         # /etc/sudo.conf is what shows the replacement came up healthy.
         migrate_real --migrate "$MIG_BOX" >/dev/null 2>&1 || true
         MIG7_MIGRATED=false
-        [ "$(box_stat "$MIG_BOX" /etc/sudo.conf)" = "0 0 644" ] && MIG7_MIGRATED=true
+        MIG7_BOX_VIEW="$(box_stat "$MIG_BOX" /etc/sudo.conf)"
+        MIG7_HOST_VIEW="$(host_stat "$MIG_BOX" /etc/sudo.conf)"
+        # Either witness shows the replacement came up healthy: the box sees
+        # 0 0 when its mapping is applied, and the host sees a mapped id instead
+        # of host root. A blocked exec is the state this check exists to cover,
+        # so the host's view alone is enough.
+        [ "$MIG7_BOX_VIEW" = "0 0 644" ] && MIG7_MIGRATED=true
+        [ -n "$MIG7_HOST_VIEW" ] && [ "$MIG7_HOST_VIEW" != "0 0 644" ] && MIG7_MIGRATED=true
         check "MIG7 a box in the worst damage state still migrates (the host reads its filesystem, and the migration succeeds from there)" \
             "[ \"\$MIG7_HOST_READS\" = true ] && [ \"\$MIG7_MIGRATED\" = true ]"
     else
@@ -786,40 +841,46 @@ echo "== migration: safety =="
 
 # ── MIG8: verify before destroy ───────────────────────────────────────────
 # Requirement SB-M5. The operation destroys containers, so the old box must
-# survive a failed migration. The failure is produced by making the
-# replacement impossible to verify: the box user is made unable to read the
-# restored files, which is precisely the condition the verification exists
-# to catch.
+# survive a failed migration.
+#
+# The failure is produced where the migration starts: it cannot create its work
+# directory, because TMPDIR names a regular file. That is deterministic, needs
+# no exec into the box, and cannot be repaired by anything the migration does —
+# unlike the earlier injections (chowning the home, removing /home/agent), which
+# either got repaired or could not complete because the box's own processes hold
+# the directory.
 if [ "$MIG6_READY" = true ]; then
     docker rm -f "$MIG_BOX" >/dev/null 2>&1 || true
     if launch_box "$MIG_BOX" && wait_box_ready "$MIG_BOX"; then
         box_write_as_user "$MIG_BOX" /home/agent/keepme.txt 'must survive a failed migration'
-        # The failure is produced by making the export impossible: the
-        # directory the migration carries is not present. That is a condition
-        # the migration must detect BEFORE it creates anything, so this also
-        # pins the ordering: no replacement is created before the export has
-        # succeeded, and therefore nothing partial can be left behind.
-        #
-        # An earlier form of this check chowned the box's home to root, on the
-        # theory that the replacement would then be unverifiable. Measured: it
-        # is not a failure at all. The restore re-establishes the box user's
-        # ownership of everything it restores, which is exactly what the box
-        # user needs, so that injection only tested the migration's ability to
-        # repair a condition it is supposed to repair. A marker OUTSIDE the
-        # removed directory shows the box is otherwise untouched.
-        docker exec -u 0 "$MIG_BOX" bash -c 'echo keep > /keepme-outside-home.txt; rm -rf /home/agent' >/dev/null 2>&1 || true
-        MIG8_OUT="$(migrate_real --migrate "$MIG_BOX" 2>&1)"
+        # A marker OUTSIDE the home directory, so "the old box is untouched" is
+        # visible even if the home directory were the thing that failed. Written
+        # as the box user, in a directory they can write: a root exec into a box
+        # that a daemon restart left without its ID mapping can block, and this
+        # marker must not depend on the state the suite is measuring.
+        MIG8_INJECTED=false
+        box_user_exec "$MIG_BOX" bash -c 'echo keep > /tmp/keepme-outside-home.txt' \
+            >/dev/null 2>&1 && MIG8_INJECTED=true
+        MIG8_TMPFILE="$MIG_TMP/not-a-directory"
+        printf 'not a directory\n' > "$MIG8_TMPFILE"
+        # as_root env …: the migration runs exactly as usual, with a TMPDIR it
+        # cannot use.
+        MIG8_OUT="$( cd "$MIG_PROJ" && as_root env TMPDIR="$MIG8_TMPFILE" "$BOC" \
+            --migrate "$MIG_BOX" 2>&1 < /dev/null )"
         MIG8_RC=$?
         # The old box must still be there, with its content.
         MIG8_OLD_EXISTS=false
         docker container inspect "$MIG_BOX" >/dev/null 2>&1 && MIG8_OLD_EXISTS=true
         MIG8_CONTENT=false
-        docker exec -u 0 "$MIG_BOX" test -f /keepme-outside-home.txt >/dev/null 2>&1 && MIG8_CONTENT=true
+        box_user_exec "$MIG_BOX" test -f /tmp/keepme-outside-home.txt >/dev/null 2>&1 && MIG8_CONTENT=true
         # A failed migration must report failure.
+        [ "$MIG8_INJECTED" = true ] || box_report "$MIG_BOX"
         check "MIG8 a migration that cannot complete reports failure" \
             "[ $MIG8_RC -ne 0 ]"
+        # The injection is part of this condition: a silently skipped one would
+        # make the migration succeed and the check pass for the wrong reason.
         check "MIG8 the old box is left untouched when the migration cannot complete" \
-            "[ \"\$MIG8_OLD_EXISTS\" = true ] && [ \"\$MIG8_CONTENT\" = true ]"
+            "[ \"\$MIG8_INJECTED\" = true ] && [ \"\$MIG8_OLD_EXISTS\" = true ] && [ \"\$MIG8_CONTENT\" = true ]"
         # No leftover replacement: exactly the one box the suite created.
         MIG8_LEFTOVERS="$(docker ps -a --format '{{.Names}}' | grep -c '^mig-' || true)"
         check "MIG8 no partial replacement is left behind" \
@@ -908,7 +969,7 @@ if [ "$MIG6_READY" = true ]; then
         # Build a tree whose shape depends on the seed.
         depth=$((seed + 1))
         files=$((seed * 3))
-        docker exec -u 0 "$MIG_BOX" bash -c "
+        root_exec "$MIG_BOX" bash -c "
             set -e
             base=/home/agent/.pi/agent/sessions/--home-agent--
             d=\"\$base\"
@@ -924,12 +985,12 @@ if [ "$MIG6_READY" = true ]; then
         # check slow without testing anything about sessions. The session
         # tree is what this property is about.
         MIG14_TREE=/home/agent/.pi/agent/sessions
-        MIG14_BEFORE="$(docker exec -u 0 "$MIG_BOX" bash -c \
+        MIG14_BEFORE="$(root_exec "$MIG_BOX" bash -c \
             "cd $MIG14_TREE && find . -type f -printf '%p %u %g\n' 2>/dev/null | sort" 2>/dev/null)"
         MIG14_DAMAGED=true
         damage_box_confirmed "$MIG_BOX" || MIG14_DAMAGED=false
         MIG14_MIGRATE_OUT="$(migrate_real --migrate "$MIG_BOX" 2>&1)"; MIG14_MIGRATE_RC=$?
-        MIG14_AFTER="$(docker exec -u 0 "$MIG_BOX" bash -c \
+        MIG14_AFTER="$(root_exec "$MIG_BOX" bash -c \
             "cd $MIG14_TREE && find . -type f -printf '%p %u %g\n' 2>/dev/null | sort" 2>/dev/null)"
         # Every file present before must be present after, owned by the box
         # user. Files the migration itself adds (the notice) are allowed, so

@@ -35,6 +35,27 @@ TARGET_USER="${HOST_USER:-agent}"
 TARGET_UID="${HOST_UID:-1000}"
 TARGET_GID="${HOST_GID:-1000}"
 
+# ── 0. Bring the home into the writable layer when the uid will change ──────
+# The image's /home/agent is in a read-only layer. On overlayfs every chown of
+# such a file copies it up AND fsyncs it, so "change the owner of 53k files"
+# becomes 53k synchronous copies. Measured on a store with 10 ms fsync latency:
+# 9 minutes for the usermod below, during which the box is not ready. Copying
+# the tree once (cp does not fsync per file) and swapping it in leaves the same
+# tree in the writable layer, where the ownership change is metadata only:
+# measured 10s for the copy and 0s for the chown.
+if [ "$(stat -c %u /home/agent 2>/dev/null || echo '')" != "${TARGET_UID}" ]; then
+    # --no-preserve=ownership: a run box has no CAP_FOWNER, so preserving the
+    # ownership of 53k files fails and cp exits non-zero; the ownership is
+    # exactly what the usermod below is about to change, so it need not be
+    # carried over. Modes, links and times still are.
+    if cp -a --no-preserve=ownership /home/agent /home/agent.lbx-copy; then
+        mv /home/agent /home/agent.lbx-old \
+            && mv /home/agent.lbx-copy /home/agent \
+            && rm -rf /home/agent.lbx-old
+    fi
+    rm -rf /home/agent.lbx-copy
+fi
+
 # Adjust the group first
 current_gid=$(id -g agent 2>/dev/null || echo "")
 if [ -n "$current_gid" ] && [ "$current_gid" != "$TARGET_GID" ]; then

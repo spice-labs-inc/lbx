@@ -160,6 +160,27 @@ pub fn path_str(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
 
+/// `printf %q` for the seed file: single-quote when needed.
+pub fn shell_quote(s: &str) -> String {
+    if !s.is_empty()
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '.' | '_' | '/' | ':' | '-' | '=' | '+' | ',' | '@' | '%')
+        })
+    {
+        return s.to_string();
+    }
+    if s.contains('\n') {
+        return format!(
+            "$'{}'",
+            s.replace('\\', "\\\\")
+                .replace('\'', "\\'")
+                .replace('\n', "\\n")
+        );
+    }
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// 16 random bytes from /dev/urandom as 32 hex characters.
 pub fn random_hex16() -> Option<String> {
     use std::io::Read;

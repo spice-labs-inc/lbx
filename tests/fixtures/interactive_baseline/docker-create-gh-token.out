@@ -1,5 +1,6 @@
+==> using llm-in-a-box:docker (full, all capabilities installed)
 ==> Creating new container 's1' (docker) ...
-    (forwarding GH_TOKEN from host environment)
+    (forwarding from the host environment: GH_TOKEN)
 
   Welcome to llm in a box... where agents are constrained
 

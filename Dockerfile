@@ -244,6 +244,11 @@ COPY --chown=agent:agent claude-settings.json /home/agent/.claude/settings.json
 COPY --chown=agent:agent docker/magic-context.jsonc \
     /home/agent/.config/cortexkit/magic-context.jsonc
 RUN echo "PS1='[${RUNTIME_TYPE}] \\u@\\h:\\w\\$ '" >> /home/agent/.bashrc
+# Host variables the launcher writes at attach: `~/.lbx/env`, 0600, owned by the
+# box user. The hook is inert until the file exists, and the vm variant installs
+# the same one from docker/vm-setup.sh — a container box and a vm box must pick
+# the forwarded variables up the same way.
+RUN printf '\n[ -f "$HOME/.lbx/env" ] && . "$HOME/.lbx/env"\n' >> /home/agent/.bashrc
 
 # ── Provisioning steps (the definition of "installed") ─────────────────────
 # The fat image runs them at build time; a slim box runs them with lbx-setup.

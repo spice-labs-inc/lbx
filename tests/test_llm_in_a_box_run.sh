@@ -5549,13 +5549,13 @@ check "REG1 interactive create, attach and start behave exactly as the baseline"
 
 # ── REG2: -- and the run-only flags without --run ──────────────────────
 # Behavior: -- without --run fails as before (exit 1, same first error
-#   line) wherever it appears; --data, --env and --timeout without --run
+#   line) wherever it appears; --data and --timeout without --run
 #   exit 1; none of them creates or writes anything.
 # Theory: a broken launcher starts treating -- as a command separator for
 #   interactive sessions, or acts on run-only flags without --run.
 # Not a text comparison: exit codes, the first error line compared with
 #   the baseline's, docker calls, file snapshots.
-# LLM: three positions for --, three run-only flags.
+# LLM: three positions for --, the two remaining run-only flags.
 reg2() {
     local ok=0 out="$WORKROOT/reg2-out" ext
     baseline_run "$LBX" dashdash-without-run "$out" "$WORKROOT/reg2-work" || return 1
@@ -5564,8 +5564,11 @@ reg2() {
             || { echo "    -- without --run: $ext differs"; ok=1; }
     done
     local R; fixture reg2; R="$(R_of reg2)"
+    # `--env` is no longer run-only: it forwards a host variable into an
+    # interactive box too (see docs, "Two image modes" / env.forward), so it is
+    # not in this list. The flags that remain run-only are still refused.
     local -a cases=("--runtime docker s1 -- true" "--runtime docker -- s1" "-- --runtime docker s1" \
-                    "--runtime docker --data $R/data s1" "--runtime docker --env X s1" "--runtime docker --timeout 5 s1")
+                    "--runtime docker --data $R/data s1" "--runtime docker --timeout 5 s1")
     local c
     for c in "${cases[@]}"; do
         snapshot reg2 "$R/snap.before"; : > "$R/argv"
@@ -5665,6 +5668,39 @@ reg4() {
     return $ok
 }
 check "REG4 --denied makes the mode-label query only for a linked deny log" reg4
+
+# ── REG5: a forwarded credential never reaches an argument vector ──────
+# Behavior: attaching to a running session with GH_TOKEN set hands the value to
+#   the box on stdin, into `~/.lbx/env` (the file the image's shell hook
+#   sources, the same file the vm path writes over ssh), and no argv of any
+#   docker call contains the value.
+# Theory: the obvious way to forward a variable is `docker exec -e NAME=value`.
+#   That puts the secret in an argument vector, which every local user can read
+#   with `ps` for as long as the session runs, and it is invisible to a test
+#   that only checks the output.
+# Not a text comparison: the docker calls the fake records as they are made, and
+#   the bytes the launcher wrote to its stdin.
+# LLM: one attach with GH_TOKEN set; the argv log is searched for the value, the
+#   captured stdin for the export line.
+reg5() {
+    local ok=0 R; R="$(R_of reg5)"
+    fixture reg5
+    printf 's1|llm-in-a-box.runtime|docker|llm-in-a-box:docker|running||||%s\n' "$(id -un)" > "$R/table"
+    : > "$R/env-stdin"
+    FAKE_ENV_STDIN_CAPTURE="$R/env-stdin" \
+        GH_TOKEN=reg5-secret-value baseline_invoke "$LBX" "$R" --runtime docker s1
+    if grep -q 'reg5-secret-value' "$R/argv"; then
+        echo "    the value is in a docker argv"
+        ok=1
+    fi
+    grep -q 'export GH_TOKEN=reg5-secret-value' "$R/env-stdin" \
+        || { echo "    the value did not arrive on stdin"; ok=1; }
+    # The hand-off itself must be a stdin write, not an argument.
+    awk 'BEGIN{RS=""; ok=0} /cat > /{ok=1} END{exit !ok}' "$R/argv" \
+        || { echo "    no stdin hand-off was made"; ok=1; }
+    return $ok
+}
+check "REG5 a forwarded credential reaches the box on stdin, never in a docker argv" reg5
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

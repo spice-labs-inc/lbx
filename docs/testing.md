@@ -211,6 +211,25 @@ The run fails when any check failed, any suite exited non-zero, any suite
 printed no result lines (RS3), or any check was skipped in every pass
 without being on the approved list (RS2).
 
+## The image-mode and in-box setup suites
+
+The suites below exist because the image split and the in-box setup path are
+only real if a virtual machine boots and is configured. Check names are the
+`[PASS]` lines the suites print.
+
+`verify-vm-*.sh` boot a virtual machine, so they are gates a host with KVM runs
+(`bash tests/verify-vm-slim-e2e.sh`), not part of `run-all-suites.sh`: its passes
+run `test_*.sh` plus `verify-run-unattended.sh`, and a host without KVM would
+only produce skips. The same is true of `tests/verify-vm-e2e.sh`, which predates
+them.
+
+| Suite | What it establishes |
+|---|---|
+| `tests/verify-vm-slim-e2e.sh` | `./build --slim vm` builds the image rather than reusing a tag; the base disk records that image's id and the `core` mode; the guest boots; `lbx-setup --list` works inside it; the plain-menu fallback installs a real step on a terminal `dialog` cannot use; a step that cannot run names its remedy; the first-entry hint appears once and not again |
+| `tests/verify-vm-design-e2e.sh` | Open CoDesign installs from its GitHub release unattended; `safeStorage` is usable **through the installed launcher wrapper** (probe: `available=true`, `roundtrip=true`, `backend=gnome_libsecret`); the browser the application finds is a real Google Chrome; a headless print yields a valid PDF with the application's arguments; the window appears on the host's X server; `--shutdown` and resume leave the application installed, the graphical marker intact, forwarding active, and the window rendering again |
+| `tests/test_lbx_setup_ui.sh` | the interactive checklist: a `dialog` that cannot initialise curses falls back to a plain numbered menu instead of reporting a cancel; a step picked by number or by name runs; an out-of-range number is refused; `--list` works with `TERM` unset |
+| `tests/test_llm_in_a_box_vm_gui.sh` | the display transport matrix (untrusted, trusted, wayland, wayland falling back to X11), the overrides (`--no-gui`, `--x11`, `--x11=trusted`, `--wayland`), degradation to a plain shell with one explanation when the host has no display, the cached graphical column, and that host credentials ride the attach (default list carries `GH_TOKEN` only; `--env` adds one) |
+
 ## Approved skips
 
 `tests/approved-skips.txt` lists the only checks allowed to skip
