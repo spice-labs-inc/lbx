@@ -55,15 +55,33 @@ check() {
 W="$(mktemp -d /tmp/lbx-gui-test.XXXXXX)"
 if [ "$QEMU_REAL" = 0 ]; then
     mkdir -p "$W/bin"
+    # The launcher asks two questions of qemu-img (`info`: is this a qcow2 base;
+    # `create`: make the overlay, in either call shape) and one of
+    # qemu-system-x86_64 (`--version`, parsed for a major >= 5). A stand-in that
+    # answers only some of them makes the vm preflight fail, and then no session
+    # exists for any of the checks below to inspect — which is exactly what
+    # happened on a runner without qemu while this suite passed on a host that
+    # had it.
     cat >"$W/bin/qemu-img" <<'SHIM'
 #!/bin/sh
 case "$1" in
-    info) printf 'image: x\nfile format: qcow2\nvirtual size: 1.0M\n' ;;
-    create) shift 3; : >"$1"; printf 'QFQ\0' >>"$1" ;;
+    info)
+        printf 'image: %s\nfile format: qcow2\nvirtual size: 1.0M\ndisk size: 196K\n' "${2:-x}"
+        ;;
+    create)
+        target=""
+        for a in "$@"; do case "$a" in *.qcow2) target="$a" ;; esac; done
+        [ -n "$target" ] || exit 1
+        printf 'QFI\373\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0' >"$target"
+        ;;
 esac
 exit 0
 SHIM
-    printf '#!/bin/sh\nexit 0\n' >"$W/bin/qemu-system-x86_64"
+    cat >"$W/bin/qemu-system-x86_64" <<'SHIM'
+#!/bin/sh
+[ "${1:-}" = "--version" ] && echo "QEMU emulator version 8.2.0 (stand-in)"
+exit 0
+SHIM
     chmod +x "$W/bin/qemu-img" "$W/bin/qemu-system-x86_64"
     PATH="$W/bin:$PATH"
     export PATH
