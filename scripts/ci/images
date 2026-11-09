@@ -242,7 +242,14 @@ fingerprint_text() {
                 while [ "$i" -lt "${#words[@]}" ] && [[ "${words[$i]}" == --* ]]; do i=$((i + 1)); done
                 ref="${words[$i]:-}"
                 [ "${#words[@]}" -gt $((i + 2)) ] && [ "${words[$((i + 1))]^^}" = AS ] && stages+="${words[$((i + 2))]} "
-                if [ -z "$ref" ] || [[ "$ref" == *'$'* ]]; then
+                # A parent image this repository builds from the SAME
+                # Dockerfile (the slim stage the full stage is FROM) is not an
+                # external input: the whole file is hashed below, so its content
+                # is already accounted for, and nothing remote is trusted.
+                # Any other variable is still refused.
+                if [ "$ref" = '${SLIM_IMAGE}' ] || [ "$ref" = '$SLIM_IMAGE' ]; then
+                    printf 'base-internal %s\n' "$ref"
+                elif [ -z "$ref" ] || [[ "$ref" == *'$'* ]]; then
                     echo "images: cannot read the base image of '${words[*]}'" >&2; rm -f "$files"; return 1
                 elif [[ "$stages" == *" $ref "* ]] || [ "$ref" = scratch ] || [[ "$ref" == *@sha256:* ]]; then
                     printf 'base %s\n' "$ref"

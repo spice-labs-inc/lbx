@@ -6,6 +6,11 @@ docker
     s1
 
 docker
+    image
+    inspect
+    llm-in-a-box:sysbox-slim
+
+docker
     inspect
     -f
     {{.State.Status}}
@@ -40,6 +45,8 @@ docker
     llm-in-a-box.runtime=sysbox
     --label
     llm-in-a-box.user=agent
+    --label
+    llm-in-a-box.provision=full
     -e
     HOST_USER=<USER>
     -e
@@ -74,6 +81,13 @@ docker
     s1
     id
     <USER>
+
+docker
+    exec
+    s1
+    sh
+    -c
+    test -x /usr/local/bin/lbx-setup && [ ! -s /home/agent/.lbx/provisioned.log ] && echo fresh
 
 docker
     exec

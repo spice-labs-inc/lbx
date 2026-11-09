@@ -150,6 +150,15 @@ case "$cmd" in
         # SHIM_INSPECT_FAIL=1 simulates "docker build exited 0 but the
         # tag never landed" (seen for real on 2026-09-02 — buildkit
         # failure swallowed by the set -e || trap).
+        # SHIM_INSPECT_FAIL_TAG=<ref> fails only for that ref, so the check
+        # can keep the slim parent image present (the full image is FROM it)
+        # while the fat tag is the one that never lands.
+        if [ -n "${SHIM_INSPECT_FAIL_TAG:-}" ]; then
+            # Exact match on the last argument (the image ref): a substring
+            # match would also fail 'llm-in-a-box:vm-slim' for 'llm-in-a-box:vm'.
+            last=""; for a in "$@"; do last="$a"; done
+            [ "$last" = "$SHIM_INSPECT_FAIL_TAG" ] && exit 1
+        fi
         if [ "${SHIM_INSPECT_FAIL:-0}" = "1" ]; then exit 1; fi
         exit 0 ;;
     export)
@@ -269,10 +278,19 @@ check "staged base carries the box-user era stamp (built-user)" \
 # build_docker_image captures docker build's exit AND verifies the tag
 # landed. Shim: docker build exits 0 but image inspect fails.
 check "a docker build that reports success but leaves no image fails with a clear error" \
-    "cd $FIXTMP/proj && LLMBOX_STATE_DIR=$FIXTMP/state SHIMLOG=$SHIMLOG SHIM_INSPECT_FAIL=1 PATH=$SHIMDIR:\$PATH bash '$BUILD' vm >/tmp/llm-in-a-box-bd2.log 2>&1; [ \$? -ne 0 ] \
+    "cd $FIXTMP/proj && LLMBOX_STATE_DIR=$FIXTMP/state SHIMLOG=$SHIMLOG SHIM_INSPECT_FAIL_TAG=llm-in-a-box:vm PATH=$SHIMDIR:\$PATH bash '$BUILD' vm >/tmp/llm-in-a-box-bd2.log 2>&1; [ \$? -ne 0 ] \
         && grep -q 'reported success but' /tmp/llm-in-a-box-bd2.log \
         && grep -q 'llm-in-a-box:vm' /tmp/llm-in-a-box-bd2.log \
         && ! grep -q 'Building base disk' /tmp/llm-in-a-box-bd2.log"
+
+# The full image is built FROM the slim image, so the slim build is a real
+# prerequisite. A host that has never built slim (every pre-split installation)
+# must not be told to remember a flag: the full build bootstraps the parent,
+# then builds the full image.
+check "a full build with no slim parent builds the parent first" \
+    ": > \$SHIMLOG; cd $FIXTMP/proj && LLMBOX_STATE_DIR=$FIXTMP/state SHIMLOG=$SHIMLOG SHIM_INSPECT_FAIL=1 PATH=$SHIMDIR:\$PATH bash '$BUILD' --full vm >/tmp/llm-in-a-box-bd3.log 2>&1; \
+        grep -q 'building the slim parent first' /tmp/llm-in-a-box-bd3.log \
+        && grep -q 'BUILD .*-t llm-in-a-box:vm-slim ' $SHIMLOG"
 
 # Requirement (2026-09-03, versioned bases): a running vm session no
 # longer BLOCKS the build — the new base lands under a fresh timestamped
@@ -400,6 +418,9 @@ check "./build all builds the relay and rebuilds the reusable vm image" \
         && grep -q 'BUILD .*-t llm-in-a-box:docker ' $SHIMLOG \
         && grep -q 'BUILD .*-t llm-in-a-box-relay:latest' $SHIMLOG \
         && grep -q 'BUILD .*-t llm-in-a-box:vm ' $SHIMLOG \
+        && grep -q 'BUILD .*-t llm-in-a-box:sysbox-slim ' $SHIMLOG \
+        && grep -q 'BUILD .*-t llm-in-a-box:docker-slim ' $SHIMLOG \
+        && grep -q 'BUILD .*-t llm-in-a-box:vm-slim ' $SHIMLOG \
         && [ -f /tmp/llm-in-a-box-build-all/state/bases/\$(readlink /tmp/llm-in-a-box-build-all/state/bases/latest)/base.qcow2 ]"
 
 # ... and `./build vm` on its own still reuses the image (no 40-minute rebuild

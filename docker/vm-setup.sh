@@ -4,20 +4,20 @@
 # (RUNTIME_TYPE=vm). Runs once per boot via llm-in-a-box-setup.service.
 #
 # Responsibilities (idempotent):
-#   0. Load the seed (HOST_USER/UID/GID, GH_TOKEN, SSH_PUBKEY) — from the
+#   0. Load the seed (HOST_USER/UID/GID, SSH_PUBKEY) — from the
 #      9p "seed0" share (primary, same mechanism as /data) or qemu fw_cfg
 #      (fallback)
 #   1. Bring up user-net networking (10.0.2.15/24, gw 10.0.2.2)
 #   2. Remap the "agent" user to the host user/UID/GID (same logic as
 #      entrypoint.sh)
 #   3. Mount the 9p project share (host0) at /data when present
-#   4. Seed sshd authorized_keys + GH_TOKEN into the user's environment
+#   4. Seed sshd authorized_keys; install the ~/.lbx/env hook
+#      (the launcher writes that file over ssh on every attach)
 #   5. Touch /run/llm-in-a-box-ready
 #
 # Every step logs to /dev/ttyS0 so the session console.log is self-diagnosing.
 #
-# Environment (from the seed): HOST_USER, HOST_UID, HOST_GID, GH_TOKEN,
-# SSH_PUBKEY
+# Environment (from the seed): HOST_USER, HOST_UID, HOST_GID, SSH_PUBKEY
 # ---------------------------------------------------------------------------
 set -uo pipefail
 
@@ -58,16 +58,34 @@ log "target user: ${TARGET_USER} (${TARGET_UID}:${TARGET_GID})"
 
 # ── Hostname: session name + sane /etc/hosts (fixes sudo's
 # "unable to resolve host" warning and gives a nicer prompt) ───────────────
-if [ -n "${HOSTNAME:-}" ]; then
-    hostnamectl set-hostname "$HOSTNAME" 2>/dev/null || true
+# systemd SANITISES the name: set-hostname "athena_site" becomes "athenasite",
+# because the underscore is not a legal hostname character. Writing the raw
+# name into /etc/hosts then left the real hostname unresolvable, so every sudo
+# printed "unable to resolve host athenasite" (and anything using the hostname
+# failed). Sanitise first, then map BOTH forms — the real hostname is read back
+# from the system so it can never disagree with what is in /etc/hosts.
+SANITISE() { printf '%s' "$1" | tr -cs 'A-Za-z0-9-' '-' | sed 's/^-*//; s/-*$//'; }
+SAFE_HOSTNAME="$(SANITISE "${HOSTNAME:-}")"
+if [ -n "$SAFE_HOSTNAME" ] && command -v hostnamectl >/dev/null 2>&1; then
+    hostnamectl set-hostname "$SAFE_HOSTNAME" 2>/dev/null || true
+fi
+if [ -n "$HOSTNAME" ] && [ "$HOSTNAME" != "$SAFE_HOSTNAME" ]; then
+    log "hostname: '$HOSTNAME' sanitised to '$SAFE_HOSTNAME' (underscores are illegal in hostnames)"
 fi
 cat > /etc/hosts <<'EOF'
 127.0.0.1 localhost
 ::1 localhost ip6-localhost ip6-loopback
 EOF
-if [ -n "${HOSTNAME:-}" ]; then
-    echo "127.0.1.1 ${HOSTNAME}" >> /etc/hosts
-fi
+# Map the hostname the system actually has, plus the requested name as an
+# alias, so `sudo` and anything else resolving the host always succeeds.
+REAL_HOSTNAME="$(hostname 2>/dev/null || echo "$SAFE_HOSTNAME")"
+{
+    printf '127.0.1.1 %s' "${REAL_HOSTNAME:-${SAFE_HOSTNAME:-box}}"
+    [ -n "${HOSTNAME:-}" ] && printf ' %s' "$HOSTNAME"
+    [ -n "${SAFE_HOSTNAME:-}" ] && [ "$SAFE_HOSTNAME" != "$REAL_HOSTNAME" ] && printf ' %s' "$SAFE_HOSTNAME"
+    printf '\n'
+} >> /etc/hosts
+log "hosts: 127.0.1.1 ${REAL_HOSTNAME:-?} ${HOSTNAME:-}"
 
 # ── 1. Networking (user-net static config; idempotent) ─────────────────────
 # The NIC may be eth0 or a predictable name (enp0s3); pick the first non-lo
@@ -172,11 +190,27 @@ fi
 chown -R "$TARGET_UID":"$TARGET_GID" "$SSH_DIR" /home/agent 2>/dev/null || true
 chmod 700 "$SSH_DIR" 2>/dev/null || true
 
-if [ -n "${GH_TOKEN:-}" ]; then
-    grep -q '^export GH_TOKEN=' /home/agent/.bashrc 2>/dev/null \
-        || echo "export GH_TOKEN=${GH_TOKEN}" >> /home/agent/.bashrc
-    log "env: GH_TOKEN exported in .bashrc"
+
+# ── 4a. Host-forwarded variables (`lbx --env` / `env.forward`) ─────────────
+# The launcher writes ~/.lbx/env (mode 0600, owned by the box user) over ssh
+# before every attach, with the host's current values — so a rotated key is
+# picked up on the next `lbx`, a removed variable disappears. A container box
+# writes the same file over `docker exec -i` stdin and sources it from the same
+# hook, so both runtimes deliver the variables the same way.
+# This unit only installs the hook that sources it; it never writes secrets.
+USER_HOME="$(getent passwd "$TARGET_UID" | cut -d: -f6)"
+USER_HOME="${USER_HOME:-/home/agent}"
+install -d -o "$TARGET_UID" -g "$TARGET_GID" -m 700 "$USER_HOME/.lbx" 2>/dev/null \
+    || mkdir -p "$USER_HOME/.lbx"
+if ! grep -q 'lbx/env' "$USER_HOME/.bashrc" 2>/dev/null; then
+    printf '
+# lbx: host variables forwarded at attach (0522)
+[ -f "$HOME/.lbx/env" ] && . "$HOME/.lbx/env"
+' \
+        >>"$USER_HOME/.bashrc"
+    chown "$TARGET_UID:$TARGET_GID" "$USER_HOME/.bashrc" 2>/dev/null || true
 fi
+log "env: ~/.lbx/env hook installed"
 
 # ── Netwall proxy plumbing (2026-09-03): with restrict=on the guest has no
 # route or DNS; the seed carries proxy settings pointing at the guestfwd

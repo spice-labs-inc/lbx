@@ -49,7 +49,23 @@ For each box:
 
 1. **Export** its home directory (`/home/agent`) through the host's view of the
    container's filesystem. This is the only path that works on a damaged box,
-   and it is why the migration does not depend on `docker exec`.
+   and it is why the migration does not depend on `docker exec`. A box that is
+   not running is started first, and the export waits for its process id: a
+   sysbox container reports pid 0 for a moment after `docker start`, and
+   `/proc/0/root` would fail for a reason that has nothing to do with the box.
+   The export is retried once with a freshly read process id, because a box that
+   its runtime restarts mid-archive changes that path under the archive tool.
+   When it still fails, the archive tool's own diagnostics are printed: an
+   unreadable entry, a full disk and a stale `/proc` path otherwise look the
+   same from the operator's side.
+
+   A box that cannot be started at all — the runtime refuses to create it
+   ("already pre-registered" from `sysbox-fs`, which is what a daemon restart
+   can leave behind), or it dies while its archive is written — is still
+   exported: the daemon streams the container's filesystem (`docker export`),
+   which needs no runtime, no `exec` and no live process, and only the home
+   directory is kept from the stream. Ownership in that stream is not used,
+   because the restore re-owns everything it writes to the box user.
 2. **Build a replacement** from the configured image, under a temporary name, as
    the same user the original box was created as.
 3. **Restore** the home directory into it and re-own it to the box user. The
@@ -158,5 +174,6 @@ those.
 | MIG11 | The notice exists at all three agent paths, is owned by and readable by the box user, says packages must be reinstalled, and tells the agent to delete it |
 | MIG12 | A file the box user owned before the migration is still owned by it and readable after: the failure that copying with `docker cp` alone produces, and the reason the restore pipes the payload instead |
 | MIG13 | A name that cannot be migrated is reported rather than crashing |
+| MIG14 | Session trees of varying depth, file count and size keep every path and its box-user ownership |
 | MIG14 | Property check: across generated session trees of varying depth and file count, every file keeps its relative path and its box-user ownership |
 | MIG15 | The create-path refusal on an unusable runtime names the sysbox boxes that already exist and the migration command, and creates nothing |

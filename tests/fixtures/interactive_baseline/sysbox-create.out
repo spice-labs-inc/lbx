@@ -1,3 +1,4 @@
+==> using llm-in-a-box:sysbox (full, all capabilities installed)
 ==> Creating new container 's1' (sysbox) ...
     (granting NET_ADMIN + /dev/net/tun — sysbox runtime; enables
      bridged VM networking.)

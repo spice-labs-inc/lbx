@@ -271,9 +271,22 @@ pub fn require_usable_runtime() -> bool {
 /// be broken, and reading through the container would corrupt the
 /// ownership.
 fn export_box(name: &str, out_tar: &Path) -> bool {
-    let pid = Docker::line(&["inspect", "-f", "{{.State.Pid}}", name])
-        .map(|s| s.lines().next().unwrap_or("").to_string())
-        .unwrap_or_default();
+    // A sysbox box can be restarted by its runtime (or by the host's memory
+    // pressure) while the archive is being written, and /proc/<pid>/root is
+    // resolved per entry: the pid changing mid-archive fails the tar with a
+    // stat error on a box that is running again by the time anyone looks. One
+    // retry with a freshly read pid covers that, and a partial archive is
+    // discarded either way.
+    if export_box_once(name, out_tar) || export_box_once(name, out_tar) {
+        return true;
+    }
+    err("    the box could not be read through its process; asking the daemon for its filesystem");
+    export_box_unstarted(name, out_tar)
+}
+
+fn export_box_once(name: &str, out_tar: &Path) -> bool {
+    let _ = std::fs::remove_file(out_tar);
+    let pid = box_pid(name, std::time::Duration::from_secs(10));
     if pid.is_empty() || pid == "0" {
         err(&format!(
             "    cannot read the box's filesystem: it is not running (pid {pid})"
@@ -312,7 +325,156 @@ fn export_box(name: &str, out_tar: &Path) -> bool {
         .arg("-cf")
         .arg(out_tar)
         .arg(".");
-    quiet(&mut c)
+    // The archive tool's own words, because "could not export" alone gives an
+    // operator nothing to act on: unreadable entries, a full disk and a stale
+    // /proc path all look the same without them.
+    c.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    match c.output() {
+        Ok(o) if o.status.success() => true,
+        Ok(o) => {
+            for line in String::from_utf8_lossy(&o.stderr).lines().take(4) {
+                err(&format!("    tar: {line}"));
+            }
+            false
+        }
+        Err(e) => {
+            err(&format!("    cannot run tar: {e}"));
+            false
+        }
+    }
+}
+
+/// Export the home directory of a box that cannot be started.
+///
+/// `/proc/<pid>/root` needs a live process, so it cannot answer for a box whose
+/// runtime refuses to create the container (sysbox-fs replies "already
+/// pre-registered" for a container it has stale state for) or that dies while
+/// its archive is being written. `docker export` asks the daemon instead: it
+/// streams the container's filesystem with no runtime, no exec and no pid. The
+/// whole filesystem is streamed and only the home directory is kept, because
+/// the home directory is all the migration carries.
+///
+/// Ownership in that stream is not used: `restore_box` extracts with
+/// `--no-same-owner` and then chowns to the box user, so container-side ids are
+/// as good as host-side ids here.
+fn export_box_unstarted(name: &str, out_tar: &Path) -> bool {
+    let Some(work) = make_work_dir() else {
+        return false;
+    };
+    let fs_root = work.join("fs");
+    let result = (|| {
+        std::fs::create_dir_all(&fs_root).ok()?;
+        // `docker export` names members without a leading slash (`home/agent/…`).
+        let Some(home) = [MIGRATE_HOME, LEGACY_HOME]
+            .into_iter()
+            .find(|candidate| extract_export_member(name, &fs_root, candidate))
+        else {
+            err("    cannot read the box's home directory from the daemon's export");
+            return None;
+        };
+        let extracted = fs_root.join(home.trim_start_matches('/'));
+        let mut c = Command::new("tar");
+        c.args(["--numeric-owner", "-C"])
+            .arg(&extracted)
+            .arg("-cf")
+            .arg(out_tar)
+            .arg(".");
+        c.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        match c.output() {
+            Ok(o) if o.status.success() => Some(()),
+            Ok(o) => {
+                for line in String::from_utf8_lossy(&o.stderr).lines().take(4) {
+                    err(&format!("    tar: {line}"));
+                }
+                None
+            }
+            Err(e) => {
+                err(&format!("    cannot run tar: {e}"));
+                None
+            }
+        }
+    })();
+    let _ = std::fs::remove_dir_all(&work);
+    result.is_some()
+}
+
+/// Write `docker export <name>` into `tar -x` for one member (a directory in the
+/// container's filesystem), returning whether that member arrived.
+///
+/// A member the archive does not contain is not an error by itself: an old box
+/// has its home at the legacy path, so both are tried and the first one that
+/// exists wins.
+fn extract_export_member(name: &str, dest: &Path, member: &str) -> bool {
+    let mut export = match Command::new("docker")
+        .args(["export", name])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return false,
+    };
+    let Some(stdout) = export.stdout.take() else {
+        let _ = export.wait();
+        return false;
+    };
+    let member_path = member.trim_start_matches('/');
+    let extracted = extract_stream_into(stdout, dest, member_path);
+    // A daemon that could not finish the stream leaves a partial tree; the
+    // member is only trusted when its directory is actually present AND the
+    // archive tool reported success on the part it wrote.
+    let exported = export.wait().is_ok_and(|s| s.success());
+    extracted && (exported || dest.join(member_path).is_dir())
+}
+
+/// Untar one member out of a tar stream into `dest`.
+///
+/// Separate from the docker call so the member naming can be tested: a
+/// `docker export` stream names members without a leading slash
+/// (`home/agent/…`), and `tar -x` with an absolute member would refuse.
+fn extract_stream_into<R: std::io::Read>(stream: R, dest: &Path, member: &str) -> bool
+where
+    Stdio: From<R>,
+{
+    match Command::new("tar")
+        .args(["-x", "-C"])
+        .arg(dest)
+        .arg(member)
+        .stdin(Stdio::from(stream))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(mut child) => child.wait().is_ok_and(|s| s.success()),
+        Err(_) => false,
+    }
+}
+
+/// A running box's pid, waiting up to `wait` for a box that was just started.
+///
+/// A sysbox container reports pid 0 between `docker start` and the moment the
+/// runtime has it running, so a single inspect can see 0 on a box that is
+/// starting up; reading /proc/0/root then fails for a reason that has nothing
+/// to do with the box.
+fn box_pid(name: &str, wait: std::time::Duration) -> String {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        let pid = Docker::line(&["inspect", "-f", "{{.State.Pid}}", name])
+            .map(|s| s.lines().next().unwrap_or("").trim().to_string())
+            .unwrap_or_default();
+        if !pid.is_empty() && pid != "0" {
+            return pid;
+        }
+        if std::time::Instant::now() >= deadline {
+            return pid;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
 }
 
 /// Restore the payload into the replacement, as the container's root, then
@@ -613,7 +775,7 @@ fn migrate_one(cfg: &Resolved, name: &str, dry: bool, invoke_dir: &Path) -> bool
     // The box must be running to export it through /proc/<pid>/root.
     if state != "running" {
         let _ = Docker::quiet(&["start", name]);
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        let _ = box_pid(name, std::time::Duration::from_secs(20));
     }
 
     let Some(work) = make_work_dir() else {
@@ -799,6 +961,44 @@ mod tests {
             features_declare_time(r#"{"linux":{"namespaces":"time"}}"#),
             Some(false)
         );
+    }
+
+    /// The member naming is the part of the daemon-export path that fails
+    /// silently if it is wrong: `docker export` writes `home/agent/…` with no
+    /// leading slash, while `tar -x` refuses an absolute member. Build that
+    /// exact shape, extract it, and require the tree to arrive.
+    #[test]
+    fn an_export_stream_extracts_its_home_member() {
+        let dir = std::env::temp_dir().join(format!(
+            "lbx-migrate-test.{}",
+            crate::util::random_hex16().expect("random")
+        ));
+        let src = dir.join("src");
+        std::fs::create_dir_all(src.join("home/agent/.pi")).expect("mkdir");
+        std::fs::write(src.join("home/agent/.pi/session.jsonl"), "payload\n").expect("write");
+        let tar_path = dir.join("stream.tar");
+        let built = std::process::Command::new("tar")
+            .args(["-C"])
+            .arg(&src)
+            .args(["-cf"])
+            .arg(&tar_path)
+            .arg("home/agent")
+            .status()
+            .expect("tar");
+        assert!(built.success(), "could not build the test archive");
+
+        let dest = dir.join("dest");
+        std::fs::create_dir_all(&dest).expect("mkdir dest");
+        let stream = std::fs::File::open(&tar_path).expect("open stream");
+        assert!(
+            extract_stream_into(stream, &dest, "home/agent"),
+            "the export stream did not extract"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("home/agent/.pi/session.jsonl")).expect("read back"),
+            "payload\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

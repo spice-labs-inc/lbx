@@ -65,6 +65,20 @@ impl Docker {
         Self::available() && Self::quiet(&["image", "inspect", image])
     }
 
+    /// An image label, or the empty string when the image or label is absent.
+    /// Old images (built before a label existed) read as empty, which every
+    /// caller treats as "the pre-split default".
+    pub fn image_label(image: &str, label: &str) -> String {
+        Self::line(&[
+            "image",
+            "inspect",
+            "--format",
+            &format!("{{{{index .Config.Labels \"{label}\"}}}}"),
+            image,
+        ])
+        .unwrap_or_default()
+    }
+
     pub fn has_runtime(name: &str) -> bool {
         Self::available()
             && Self::line(&["info", "--format", "{{json .Runtimes}}"])
@@ -147,7 +161,9 @@ pub struct InteractiveRun {
     pub host_user: String,
     pub host_uid: u32,
     pub host_gid: u32,
-    pub gh_token: Option<String>,
+    /// The image mode recorded on the container (`llm-in-a-box.provision`).
+    /// Empty when unknown, in which case no label is written (old boxes).
+    pub provision: String,
     pub vm_web_port: String,
     pub netwall: Option<Netwall>,
     pub devices: Vec<String>,
@@ -178,6 +194,12 @@ pub fn interactive_run_argv(r: &InteractiveRun) -> Vec<String> {
         format!("llm-in-a-box.runtime={}", r.runtime),
         "--label".into(),
         format!("llm-in-a-box.user={}", r.box_user),
+    ]);
+    if !r.provision.is_empty() {
+        v.push("--label".into());
+        v.push(format!("llm-in-a-box.provision={}", r.provision));
+    }
+    v.extend([
         "-e".into(),
         format!("HOST_USER={}", r.host_user),
         "-e".into(),
@@ -185,10 +207,10 @@ pub fn interactive_run_argv(r: &InteractiveRun) -> Vec<String> {
         "-e".into(),
         format!("HOST_GID={}", r.host_gid),
     ]);
-    if let Some(t) = &r.gh_token {
-        v.push("-e".into());
-        v.push(format!("GH_TOKEN={t}"));
-    }
+    // Host credentials are NOT placed here. `docker run -e` would write them
+    // into the container's config, where `docker inspect` shows them to anyone
+    // in the docker group and a months-old value survives a key rotation.
+    // They reach the box at attach time instead (session::attach_session).
     if !r.vm_web_port.is_empty() {
         v.push("-e".into());
         v.push(format!("VM_WEB_PORT={}", r.vm_web_port));
@@ -541,7 +563,6 @@ mod tests {
             host_user: "dev".into(),
             host_uid: 1001,
             host_gid: 1002,
-            gh_token: Some("ghp_x".into()),
             vm_web_port: "8443:443".into(),
             netwall: Some(Netwall {
                 relay_name: "llm-in-a-box-relay-s2".into(),
@@ -551,6 +572,7 @@ mod tests {
             devices: v(&["/dev/ttyUSB0"]),
             ports: v(&["8443:8443", "18080:8080"]),
             data_dir: "/work/p".into(),
+            ..Default::default()
         };
         assert_eq!(
             interactive_run_argv(&r),
@@ -572,8 +594,6 @@ mod tests {
                 "HOST_UID=1001",
                 "-e",
                 "HOST_GID=1002",
-                "-e",
-                "GH_TOKEN=ghp_x",
                 "-e",
                 "VM_WEB_PORT=8443:443",
                 "-e",

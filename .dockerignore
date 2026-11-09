@@ -16,3 +16,10 @@ Cargo.toml
 Cargo.lock
 *.swp
 *~
+# Generated box state, never build input. The vm runtime's Docker store lives
+# here as a sparse image that is ~500 GB *apparent*: the classic builder writes
+# a context file's full logical size, so without this line a build started from
+# a project directory that has run a vm box stalls or fills the disk.
+vms_and_docker_from_llm_box
+# Release artifacts checked out next to the source (14 MB, never COPYed).
+*.deb

@@ -9,6 +9,7 @@ pub mod cli;
 pub mod config;
 pub mod docker;
 pub mod migrate;
+pub mod mode;
 pub mod netpolicy;
 pub mod run;
 pub mod session;

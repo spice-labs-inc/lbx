@@ -402,6 +402,20 @@ case "${1:-}" in
         fi
         exec "$BASE" "$@"
         ;;
+    info)
+        # `docker info --format '{{json .Runtimes}}'`: the launcher probes this
+        # before a sysbox create. Answering it lets the interactive baseline's
+        # sysbox scenario be captured and replayed on a host WITHOUT sysbox —
+        # the scenario pins the argv shape, not the runtime's presence.
+        note "$@"
+        fmt=""
+        # The dispatch does not shift: $1 is "info", so --format is $2.
+        [ "${2:-}" = "--format" ] && fmt="${3:-}"
+        case "$fmt" in
+            *Runtimes*) printf '{"sysbox-runc":{},"runc":{}}\n'; exit 0 ;;
+            *) printf '{}\n'; exit 0 ;;
+        esac
+        ;;
     inspect|container)
         # The relay's numeric address on a network.
         fmt=""
@@ -456,6 +470,26 @@ case "${1:-}" in
         exec "$BASE" "$@"
         ;;
     exec)
+        # The attach's credential hand-off: `exec -i -u <user> -e HOME=<home>
+        # <box> sh -c '<script that writes $HOME/.lbx/env>'`. Recognised by exact
+        # shape (the script must write that file), consumed from stdin so the
+        # launcher's write cannot fail with a broken pipe, and recorded when
+        # FAKE_ENV_STDIN_CAPTURE is set — the payload is what the test asserts on,
+        # because the point is that it is NOT in the argv this log holds.
+        if [ "${2:-}" = "-i" ] && [ "${3:-}" = "-u" ] && [ "${5:-}" = "-e" ] \
+                && [ "${8:-}" = "sh" ] && [ "${9:-}" = "-c" ]; then
+            case "${10:-}" in
+                *'.lbx/env'*)
+                    note "$@"
+                    if [ -n "${FAKE_ENV_STDIN_CAPTURE:-}" ]; then
+                        cat > "$FAKE_ENV_STDIN_CAPTURE"
+                    else
+                        cat >/dev/null
+                    fi
+                    exit 0
+                    ;;
+            esac
+        fi
         # The command's exec: second word exactly -i, gosu in the vector.
         if [ "${2:-}" = "-i" ]; then
             is_cmd=0

@@ -53,9 +53,19 @@ newgrp docker
    ./build docker
    ```
 
-   `./build all` builds everything instead — the sysbox, docker, netwall
-   relay and vm images, and a fresh vm base disk — which is what a machine
-   that runs all three runtimes wants.
+   Prefer a small, fast-building image that installs what it needs on demand?
+   Build the slim variant instead (about five minutes) and launch it with
+   `--slim` — same Dockerfile, same provisioning steps, see
+   [Two image modes](#two-image-modes-full-and-slim):
+
+   ```bash
+   ./build --slim docker
+   lbx --slim --runtime docker my_session
+   ```
+
+   `./build all` builds everything instead — both image modes, the relay
+   and the vm images and a fresh vm base disk per mode — which is what a
+   machine that runs all three runtimes wants.
 
 3. Launch a session from your project directory and start an agent inside
    it. The current directory is mounted at `/data`; the in-box user is your
@@ -182,6 +192,99 @@ sysfs serial scan and the identity check (tests/test_vm_docker_store.sh S20,
 S21, S21b, S22). Once the vm image is built, auto-detection prefers it:
 `lbx <name>` without `--runtime` picks vm, then sysbox, then docker.
 
+## Two image modes: full and slim
+
+One `Dockerfile`, one set of provisioning steps (`docker/provision.d/`), two
+images. The steps are the single definition of "installed"; the modes differ
+only in *when* they run.
+
+| | `full` — `llm-in-a-box:<runtime>` | `slim` — `llm-in-a-box:<runtime>-slim` |
+|---|---|---|
+| Build time | ~20 to 40 minutes | ~5 minutes |
+| Contents | everything, installed at build time | OS, box user, entrypoint, docker, node, gh, CLI tools, the provisioning steps |
+| Adding Rust later | already there | `lbx-setup rust` inside the box |
+| Updates | rebuild the image | `lbx-setup claude pi opencode omp` installs the latest |
+
+```bash
+./build all                # every runtime, BOTH modes (slim first: full is FROM slim)
+./build --slim all         # slim only
+./build docker             # full only, exactly as before
+lbx --slim my_session      # launch the slim image (build it first)
+lbx --full my_session      # the preprovisioned image (the default)
+```
+
+`./build <runtime>` and `./build --slim <runtime>` follow the same reuse rule
+as before: an existing image tag is reused, `./build all` rebuilds. Editing a
+provisioning step therefore needs `./build all` (or an explicit
+`docker rmi <image>` first) to reach the image — `--slim vm` in particular
+still reuses the vm image and only rebuilds the base disk.
+
+Which image a launch uses: `--slim`/`--full`, then `mode` in the config
+(`full` default, `slim`, or `auto` = slim when a slim image exists), then
+`full`. Nothing about the default path changes: a machine that never builds a
+slim image behaves exactly as before. Every launch prints the image and its
+mode, and `lbx --list` has a `MODE` column.
+
+The first attach to a slim box that has nothing installed yet says so, once:
+
+```
+  This box has nothing installed yet (slim image).
+    lbx-setup            tick what to install (checklist)
+    lbx-setup --list     what is available, what is installed
+```
+
+It is a hint, not a prompt, because attach is scriptable. Once `lbx-setup` has
+run, the box is quiet.
+
+Inside a slim box:
+
+```bash
+lbx-setup               # checklist of capabilities
+lbx-setup --list        # what is available, what is installed
+lbx-setup rust,jvm      # install exactly those (latest)
+lbx-setup --all         # everything
+```
+
+Steps: `build-tools`, `rust` (the base toolchain), `rust-extras` (the eight
+cargo add-ons — compiled from source, ~10 minutes, not needed day to day, so it
+is a step of its own), `jvm`, `python`, `editors`, and one per coding tool:
+`bun`, `claude`, `pi`, `opencode`, `omp`. Pi's extensions are installed by Pi
+itself (`pi install`), so `pi update --extensions` and `lbx-setup pi` cannot
+disagree. Each step is idempotent, installs current releases (unpinned, exactly
+like `pi update` inside a full box), runs its own smoke test, and records what
+it installed in `~/.lbx/`. `lbx-setup --all` runs every step — the full image's
+set — while `lbx-setup rust` gives you Rust without the add-ons.
+
+Optional tiers: a step that should not exist in the full image lives in
+`docker/optional.d/` (slim, any runtime) or `docker/optional-vm.d/` (slim, vm
+runtime only). They are never run by the full image, never part of `--all`, and
+the vm-only tier is not even copied into a docker/sysbox slim image.
+
+Consequences worth knowing:
+
+- **`--run` requires the full image.** An unattended run box has no sudo and
+  no inner docker, so it cannot provision itself; `lbx` refuses a slim image
+  with that explanation instead of failing on a missing `claude`.
+- **vm base disks are per mode.** Base disks stay immutable and versioned;
+  each records the mode it was built for (`bases/<timestamp>/provision`), and
+  a slim session picks a slim base. `./build --slim vm` makes one.
+
+### GUI apps in a vm box
+
+A GUI app is installed inside a vm box with `lbx-setup` and declares the
+transport it needs by writing `~/.lbx/gui` (`transport=x11` or `wayland`).
+`lbx-setup design` (Open CoDesign) resolves the latest release for the box's
+architecture, downloads it, checks it is really a Debian package, installs it
+and its Electron libraries, and then tells you to re-attach — the transport is
+chosen per attach, so the session you install in cannot have one.
+Nothing else to remember: the next `lbx <name>` reads that marker over ssh and
+forwards the display — `ssh -X` for X11, `waypipe ssh` for Wayland — prints one
+line saying so, and `lbx --list` shows a `GUI` column. X11 and Wayland ride the
+existing ssh connection, so the box never gets a route to your display and the
+network wall is unaffected. If the host has no display, the attach still works
+and says why. Overrides exist but are never required: `--no-gui`,
+`--x11=trusted` (`ssh -Y`), `--wayland`.
+
 ## Unattended runs
 
 `lbx --run` runs one command, once, with no terminal, in a new box that is
@@ -241,7 +344,7 @@ A session name maps to at most one instance across all runtimes, and
 `[A-Za-z0-9][A-Za-z0-9._-]*`.
 
 ```bash
-lbx --list                          # NAME RUNTIME STATE PORT, all runtimes
+lbx --list                          # NAME RUNTIME STATE PORT NET-POLICY MODE GUI
 lbx --shutdown foo bar              # graceful stop, keeps the sessions for resume
 lbx --stop --force foo              # same, but docker kill / qemu SIGKILL
 lbx --destroy foo                   # remove the session, any runtime
@@ -276,6 +379,9 @@ warning for `--list`, `--destroy`, `--stop`, `--shutdown` and `--denied`.
 | Config key | Environment variable | Default |
 |---|---|---|
 | `image.sysbox` / `image.docker` / `image.vm` | (none) | `llm-in-a-box:sysbox` / `:docker` / `:vm` |
+| `image.sysbox.slim` / `image.docker.slim` / `image.vm.slim` | (none) | the same tags with `-slim` |
+| `mode` | `LBX_MODE` | `full` (`slim` = install on demand; `auto` = slim when a slim image exists) |
+| `env.forward` | `LBX_ENV_FORWARD` | `GH_TOKEN` (add model keys here, or per session with `--env`) |
 | `state.dir` | `LBX_STATE_DIR` | `~/.llm-in-a-box` (sessions, base disks, run status, deny logs) |
 | `vm.mem` | `LBX_VM_MEM` | `16384` (MiB) |
 | `vm.cpus` | `LBX_VM_CPUS` | `8` |
@@ -285,12 +391,24 @@ warning for `--list`, `--destroy`, `--stop`, `--shutdown` and `--denied`.
 | `vm.missing` | `LBX_VM_MISSING` | unset (test only: pretend named vm prerequisites are missing) |
 | `runtime.default` | `LBX_RUNTIME_DEFAULT` | unset (auto-detect: vm if built, else sysbox, else docker) |
 
-`./build` reads the same images through `lbx --print-images` and the same
-state directory through `lbx --print-state-dir`, so a build and a launch
-never disagree. A configured `image.vm` must carry `bash`, `qemu-utils`,
-`e2fsprogs`, `tar` and a kernel in `/boot`, because the base disk is built
-inside it. If `GH_TOKEN` is set on the host, interactive sessions forward
-it so `gh` works inside the box.
+`./build` reads the same images through `lbx --print-images` (and the slim
+refs through `lbx --print-images --slim`) and the same state directory
+through `lbx --print-state-dir`, so a build and a launch never disagree. A
+configured `image.vm` must carry `bash`, `qemu-utils`, `e2fsprogs`, `tar`
+and a kernel in `/boot`, because the base disk is built inside it.
+
+`--env NAME` (repeatable) forwards a host variable into the box; without it
+the `env.forward` list applies (default: `GH_TOKEN`). Only the variable's
+**name** is ever printed, never its value.
+
+Credentials travel at **attach** time, not at create: a container gets them on
+the `docker exec` line, and a vm box gets them written to `~/.lbx/env` over
+ssh — so `docker inspect` never shows a token, a rotated key is picked up on
+the next `lbx`, and the values disappear with the session. Add
+`ANTHROPIC_API_KEY,UMANS_API_KEY,DEEPSEEK_API_KEY,ZAI_API_KEY` to
+`env.forward` to have the in-box agents pick them up with no in-box
+configuration. A name that is unset on the host is skipped, so a box that
+authenticates with OAuth inside is unaffected.
 
 ## Boxes created by the old launcher
 

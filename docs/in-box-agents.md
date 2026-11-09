@@ -6,15 +6,44 @@ with several coding agents preinstalled. This page lists what is there and
 how to authenticate each agent inside a box. The in-box user is `agent`
 (uid 1000), remapped to your host user at start.
 
+There are **two modes** of the same image, and this page describes both:
+
+The checklist needs a terminal `dialog` can use. If the terminal's terminfo is
+missing (`TERM=xterm-kitty` and friends) or `TERM` is unset, `dialog` cannot
+initialise and `lbx-setup` falls back to a plain numbered menu — the same
+selection, no curses — rather than reporting a cancel. `export
+TERM=xterm-256color` restores the TUI.
+
+| Mode | Image | What it means |
+|---|---|---|
+| `full` | `llm-in-a-box:<runtime>` | every toolchain and agent installed at build time (this is what shipped before the split, and the default) |
+| `slim` | `llm-in-a-box:<runtime>-slim` | OS, box identity, docker, node, gh and CLI tools only; the same provisioning steps install the rest on demand with `lbx-setup` |
+
+Optional tiers, on top of the provisioning set:
+
+| Tier | Directory | Shipped in | `--all` | Example |
+|---|---|---|---|---|
+| optional | `docker/optional.d/` | every slim image | no | `pnpm` |
+| optional-vm | `docker/optional-vm.d/` | the vm slim image only | no | `design` (Open CoDesign, needs X11 forwarding) |
+
+Neither tier is ever run by the full image, and the full image does not carry
+them at all.
+
+`docker/provision.d/` is the single definition of "installed": the `full`
+image runs those steps at build time, a `slim` box runs them when you ask.
+Nothing about an installed tool differs between the modes — only when it
+arrived.
+
 ## Toolchains and tools
 
-| Category | Contents |
-|---|---|
-| Languages | Rust (stable plus `wasm32-unknown-unknown`), Python 3, OpenJDK 21, Node.js 24 |
-| Build tools | Cargo, Maven, Gradle, SBT, npm, cmake, pkg-config, protoc |
-| Rust extras | wasm-pack, cargo-watch, cargo-edit, cargo-expand, cargo-audit, cargo-outdated, cargo-deny, sccache, rustfmt, clippy, rust-analyzer |
-| Infrastructure | Ansible, Docker CE with Compose and Buildx (the inner docker of an interactive session) |
-| Command line | ripgrep, fd, bat, tree, htop, jq, yq, tmux, git, curl, wget, gh, vim, emacs |
+| Category | Contents | Mode |
+|---|---|---|
+| Base | Ubuntu 24.04, git/curl/wget, ripgrep, fd, bat, tree, htop, jq, tmux, vim, build-essential, pkg-config, libssl-dev, python3, dialog | both |
+| Infrastructure | Docker CE with Compose and Buildx (the inner docker of an interactive session), gh, yq | both |
+| Languages | Rust (stable, `wasm32`, rustfmt/clippy/rust-analyzer), OpenJDK 21 + Maven + Gradle + sbt, Node.js 24, Python 3 (pip/venv/full), Ansible | `full`, or `lbx-setup rust,jvm,python` |
+| Rust add-ons | wasm-pack, cargo-watch, cargo-edit, cargo-expand, cargo-audit, cargo-outdated, cargo-deny, sccache — compiled from source, ~10 min, not needed day to day | `full`, or `lbx-setup rust-extras` (opt-in step of its own) |
+| Extras | Emacs | `full`, or `lbx-setup editors` |
+| Agents | Claude Code, Pi (with its plugins), OpenCode, OMP (with Bun) — one provisioning step each | `full`, or `lbx-setup claude pi opencode omp` (+ `bun` for OMP) |
 
 If `GH_TOKEN` is set on the host, interactive sessions forward it, so `gh`
 works without further setup.
@@ -24,7 +53,77 @@ works without further setup.
 Agent versions are deliberately unpinned: an image build installs the
 latest release of each, so rebuilding the image picks up fixes. The few
 pins (Bun, Gradle, the sysbox image's docker-ce and containerd) are
-explained in the Dockerfile.
+explained in the Dockerfile. In `slim` mode the same is true of
+`lbx-setup claude` / `pi` / `opencode` / `omp`: they install the current
+release, which is also what `pi update` and `pi update --extensions` do
+inside a running box. Pi's extensions belong to Pi's step, installed with
+`pi install`, so the two paths cannot disagree.
+
+### The first entry into a slim box
+
+A slim box has nothing installed, so the first attach says so — once:
+
+```
+  This box has nothing installed yet (slim image).
+    lbx-setup            tick what to install (checklist)
+    lbx-setup --list     what is available, what is installed
+```
+
+A hint rather than a prompt: attach is scriptable (`lbx s && claude -p …`), and
+a blocking TUI there would break that. The condition is the provisioning log
+the steps write, so a configured box is never nagged again, and a full image
+(which has the log from build time) never sees it. The decision falls back to
+the resolved image mode when the probe cannot answer, so a fresh slim box is
+never mistaken for a configured one — verified by
+`tests/verify-vm-slim-e2e.sh` ("a fresh slim box is told how to set it up",
+"and names the command to run", "a configured box is not nagged again").
+
+### Optional steps that need a display (vm only)
+
+`lbx-setup design` installs Open CoDesign: it resolves the latest GitHub
+release for the box's architecture (`LBX_DESIGN_VERSION` pins one), downloads
+the `.deb`, verifies the archive magic, installs the Electron libraries and the
+package, and writes `~/.lbx/gui` (`transport=x11`). Then it tells you to exit
+and re-run `lbx <name>`: the display transport is chosen per attach, so the
+session you install in cannot have one. After the re-attach the launcher prints
+`==> GUI app in this box: forwarding x11`, and the marker survives a
+`--shutdown`/resume.
+
+The install is verified end to end by `tests/verify-vm-design-e2e.sh`, which
+boots a virtual machine and checks: the release asset resolves, the step
+succeeds, the package and launcher wrapper are installed, the keychain probe
+reports a usable store **through the wrapper**
+(`safeStorage is available through the installed wrapper`), a browser the
+application's own rule finds is a real Google Chrome and not the Ubuntu snap
+stub, a headless print produces a valid PDF with the application's arguments,
+the window appears on the host's X server, the virtual machine shuts down and
+resumes, and the application still renders afterwards. The checklist itself is
+covered by `tests/test_lbx_setup_ui.sh` (a `dialog` that cannot initialise
+curses falls back to the plain menu; a chosen step runs; cancel is not a
+failure; `--list` needs no curses).
+
+### Model credentials from the host
+
+`lbx` forwards the host variables named in `env.forward` (default `GH_TOKEN`)
+into an interactive box, and `--env NAME` adds or replaces one for a session.
+Only the names are printed, never the values. The values are passed at
+**attach** time as the file `~/.lbx/env` (0600, owned by the box user) — written
+over stdin for a container and over ssh for the vm — and the box user's shell
+sources it. So no value is in any `docker exec` or `docker run` argument vector
+(where `ps` would show it), `docker inspect` never contains a token, and a
+rotated key takes effect on the next `lbx`.
+
+The set of variables actually forwarded is verified behaviourally by
+`tests/test_llm_in_a_box_vm_gui.sh` ("the default forward list carries
+GH_TOKEN", "and carries no model key unless one is asked for").
+
+The agents read those variables from the environment, so no in-box
+configuration file is generated: Claude Code takes `ANTHROPIC_API_KEY`, Pi and
+OMP take `ANTHROPIC_API_KEY` / `UMANS_API_KEY` / `ZAI_API_KEY`, OpenCode reads
+its provider environment, and `gh` uses `GH_TOKEN`. A variable that is unset on
+the host is skipped, so a box that logs in with OAuth inside is unaffected.
+The one exception is OMP's Umans provider, which needs a `models.yml` block;
+that is written by `docker/provision.d/60-bun-agents.sh`, not by the launcher.
 
 | Agent | Command | Package |
 |---|---|---|

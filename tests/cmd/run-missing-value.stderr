@@ -4,6 +4,16 @@ Usage: lbx [options] <session_name>
 Options:
   --runtime <sysbox|docker|vm>          Choose isolation runtime (default: auto-detect;
                                         see runtime.default in the config file)
+  --slim                                Launch the slim image for this runtime: capabilities
+                                        are installed inside the box with lbx-setup
+  --full                                Launch the preprovisioned image (the default)
+  --env <NAME>                          Forward host variable NAME into the box
+                                        (repeatable; interactive sessions and --run)
+  --no-gui                              Do not forward a display even if the box
+                                        has a GUI app (vm attach only)
+  --x11[=trusted]                       Force X11 forwarding on this attach
+                                        (=trusted is ssh -Y; default ssh -X)
+  --wayland                             Force wayland (waypipe ssh) on this attach
   --device <path>                       Pass a host device into the session (repeatable)
   --fuse                                Enable FUSE support
   --ports                               Expose session ports 8080 and 3000 on the host
@@ -24,6 +34,7 @@ Options:
   --net-policy <file>                    Host-side network wall policy (JSON: mode/allow/block); default: no wall
   --denied <name>                        Print the session's deny log
   --print-images                        Print the configured image refs (build parity; internal)
+                                        With --slim: the slim refs instead
   --print-state-dir                     Print the resolved state directory (build parity; internal)
   --run                                 Unattended run: run one command in a new, locked-down box,
                                         then remove the box (see "Unattended runs" below)
@@ -75,6 +86,10 @@ Configuration (precedence: CLI flag > env var > config file > default):
   File:   $LBX_CONFIG (default ~/.config/llm_in_a_box/config).
           Lines are key=value; # comments allowed.
   Keys:   image.sysbox|image.docker|image.vm   image refs (default llm-in-a-box:*)
+          image.<runtime>.slim                 slim refs (default <image>-slim)
+          mode             LBX_MODE             full (default) | slim | auto
+          env.forward      LBX_ENV_FORWARD      host variables forwarded at attach
+                                               (default: GH_TOKEN; add model keys here)
           state.dir        LBX_STATE_DIR        global box-state dir (default ~/.llm-in-a-box)
           vm.mem           LBX_VM_MEM           vm memory in MiB (default 16384)
           vm.cpus          LBX_VM_CPUS          vm vCPUs (default 8)

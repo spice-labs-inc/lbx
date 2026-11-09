@@ -22,7 +22,7 @@ tests/verify-run-unattended.sh VRUN2, VRUN10). See
 
 | File | Purpose |
 |------|---------|
-| `lbx` | The launcher (a Rust binary, built from the crate at the repository root). `--runtime sysbox\|docker\|vm` or auto-detect. Creates/starts/attaches sessions. vm lifecycle: qemu launch, ssh attach (lands in `/data`), `--shutdown` (graceful, resume-able), `--destroy`. Cross-runtime session management: a name maps to one instance across runtimes; existing instance wins over auto-detect; explicit conflicting `--runtime` errors; `--stop`/`--shutdown` accept multiple names (graceful; `--force` kills); `--list` prints NAME/RUNTIME/STATE/PORT; names validated `[A-Za-z0-9][A-Za-z0-9._-]*`; vm sessions record their origin directory and reuse it for the `/data` mount on relaunch. Legacy-duplicate removal: `--runtime` selects the instance for `--destroy`/`--stop`/`--shutdown` of ambiguous names, with sibling notes, conflict guards, and up-front runtime validation — see docs/llm/session-removal-disambiguation_llm.md. Unattended runs: `--run` (one command in a fresh, unprivileged, walled run box, then cleanup; exit code = command's; 125 refusal/setup failure, 124 timeout; outcome in `$LBX_STATE_DIR/runs/<name>/status`; tests/test_llm_in_a_box_run.sh RUN12, RUN14, RUN16, RUN17) and its flags `--data`, `--env`, `--timeout`, plus the opt-in `--socket-dir` (read-only `/run/agent` mount of a caller socket directory: RUN98, RUN99), `--no-network` (instead of `--net-policy`: `--network none`, no relay: RUN103, RUN104) and `--apparmor-profile` (llm-in-a-box AppArmor profile on the run box: RUN109, RUN110) — see docs/llm/unattended-runs_llm.md. Migration: `--migrate [--all] [--dry-run] <name>...` rebuilds existing sysbox boxes on the current stack, carrying `/home/agent` across (needs root or `sudo -E`; tests/test_llm_in_a_box_migrate.sh MIG1-MIG15); see docs/llm/sysbox-migration_llm.md. |
+| `lbx` | The launcher (a Rust binary, built from the crate at the repository root). `--runtime sysbox\|docker\|vm` or auto-detect. Creates/starts/attaches sessions. vm lifecycle: qemu launch, ssh attach (lands in `/data`), `--shutdown` (graceful, resume-able), `--destroy`. Cross-runtime session management: a name maps to one instance across runtimes; existing instance wins over auto-detect; explicit conflicting `--runtime` errors; `--stop`/`--shutdown` accept multiple names (graceful; `--force` kills); `--list` prints NAME/RUNTIME/STATE/PORT/NET-POLICY/MODE; names validated `[A-Za-z0-9][A-Za-z0-9._-]*`; vm sessions record their origin directory and reuse it for the `/data` mount on relaunch. Legacy-duplicate removal: `--runtime` selects the instance for `--destroy`/`--stop`/`--shutdown` of ambiguous names, with sibling notes, conflict guards, and up-front runtime validation — see docs/llm/session-removal-disambiguation_llm.md. Unattended runs: `--run` (one command in a fresh, unprivileged, walled run box, then cleanup; exit code = command's; 125 refusal/setup failure, 124 timeout; outcome in `$LBX_STATE_DIR/runs/<name>/status`; tests/test_llm_in_a_box_run.sh RUN12, RUN14, RUN16, RUN17) and its flags `--data`, `--env`, `--timeout`, plus the opt-in `--socket-dir` (read-only `/run/agent` mount of a caller socket directory: RUN98, RUN99), `--no-network` (instead of `--net-policy`: `--network none`, no relay: RUN103, RUN104) and `--apparmor-profile` (llm-in-a-box AppArmor profile on the run box: RUN109, RUN110) — see docs/llm/unattended-runs_llm.md. Migration: `--migrate [--all] [--dry-run] <name>...` rebuilds existing sysbox boxes on the current stack, carrying `/home/agent` across (needs root or `sudo -E`; tests/test_llm_in_a_box_migrate.sh MIG1-MIG15); see docs/llm/sysbox-migration_llm.md. |
 | `docker/vm-docker-store.sh` | Guest first-boot wiring, sourced by `docker/vm-setup.sh`: finds the attached NVMe device (serial `lbx-docker-store`; a base built by the older launcher was given `llm-in-a-box-docker-store`, which is longer than the NVMe serial field holds, so the kernel reports the truncated `llm-in-a-box-docker-` and the finder matches that prefix in the by-id glob, the sysfs serial scan and the identity check: S21, S21b, S22; S20 pins the older `boc-docker-store` serial), formats it only when it carries no filesystem, mounts it at `/srv/docker-store`, points containerd's root and Docker's data-root inside, self-heals this project's earlier config values, uses `--no-block` daemon actions, plants the first-reader README, and marks a fallback. Behavioral checks: tests/test_vm_docker_store.sh S1, S2, S4, S7, S10, S16, S20, S21, S21b, S22. |
 | `docker/docker.service.d/llm-in-a-box.conf`, `docker/containerd.service.d/llm-in-a-box.conf` | systemd drop-ins (`After=`/`Wants=llm-in-a-box-setup.service`) so socket-activated daemons cannot start before the store is mounted; the ordering is asserted by tests/verify-vm-e2e.sh E5 (KVM host; deferred here). |
 | `build` | Builds images. `./build all` builds every image — sysbox, docker, the netwall relay, and the vm image plus its base disk — and REBUILDS the vm image (a base disk is only as new as the rootfs it was built from); `./build vm` alone reuses an existing vm image and only builds a disk (a full image build is 30-40 minutes; test_build_vm.sh, "all builds the relay and rebuilds the reusable vm image" and "build vm alone still reuses an existing vm image"). `./build vm` also produces the bootable base disk + kernel, in the launcher's state directory (`$LBX_STATE_DIR/bases/<timestamp>/`, with `bases/latest`), which it resolves through the launcher's hidden `--print-state-dir` subcommand (ADR 013) — never through the working directory (test_build_vm.sh, "build vm derives nothing from the working directory"; the resolution seam is pinned by the `--print-state-dir resolves env > config file > default` check in test_llm_in_a_box_vm.sh). `bases/<ts>/from-image` records the image the disk came from: line 1 the ref (or repo digest), line 2 `image-id <id>`. The vm preflight compares CONTENT when both ids are known — a rebuild under the same tag warns, identical content under a renamed ref does not — and otherwise falls back to the ref, resolving a recorded digest against the configured image's own digest (Docker 29 reports a repo digest even for locally built images, so a raw digest-vs-tag string compare false-positives). Checks: CFG30, CFG36. Base GC after a build reads overlays with `qemu-img info -U` so a RUNNING session's write lock does not disable it (test_build_vm.sh, "a locked (running-session) overlay does not disable GC"), and the running-session note comes from `$LBX_STATE_DIR/sessions/*/qemu.pid` (live pid), not `pgrep qemu-system-x86_64`. The rootfs.tar export is staged under `$LBX_STATE_DIR/tmp`. The SCRATCH directory (where the rootfs is unpacked and the 30G base.raw is filled with it) is a `/tmp` scratch by default and `LBX_VM_BUILD_WORK` moves it to another real local filesystem: it needs roughly twice the rootfs size, and a small root disk fills up and kills the build (measured: a 7G rootfs against 12G free; the mkfs output is suppressed under `set -euo pipefail`, so the log simply stops). It must not be the 9p project export (that refuses `chown` to root) while the state directory may be, hence the separation; a caller-supplied scratch is never deleted (test_build_vm.sh, the scratch-directory and placement checks). `./build relay [--label KEY=VALUE]...` adds image labels to the relay build (relay only; the unlabeled call is unchanged). |
@@ -42,6 +42,10 @@ tests/verify-run-unattended.sh VRUN2, VRUN10). See
 | `claude-settings.json`, `update-claude-code.sh` | Claude Code settings copied to the box user's `~/.claude/settings.json` (deny rules for mutating git commands), and the in-box `update-claude-code` command. What the image installs: docs/in-box-agents.md. |
 
 ## Installed Agents & Plugins
+
+Two image modes share these steps: `full` runs them at build time,
+`lbx-setup claude pi opencode omp` (and `bun` for OMP) runs them inside a `slim` box (same
+`docker/provision.d/` scripts in both, so the modes cannot drift).
 
 - **Claude Code** — `@anthropic-ai/claude-code` (unpinned)
 - **Pi** — `@earendil-works/pi-coding-agent` (unpinned; `@mariozechner/...`
@@ -358,6 +362,33 @@ sysbox-mgr"*.
 bridge tooling (sysbox only), vm boot packages + setup unit (vm only),
 `LBX_RUNTIME_TYPE` env + PS1. Agents/plugins are unpinned-latest;
 deliberate pins: Bun (OMP dep), Gradle, sysbox docker-ce/containerd.
+
+### Image modes (full | slim)
+
+- The Dockerfile's `slim` stage (built by `./build --slim <runtime>`) produces
+  `llm-in-a-box:<runtime>-slim`: Ubuntu + box user +
+  entrypoint + docker + node + gh + CLI tools + `dialog` + `lbx-setup` +
+  `/opt/llm-in-a-box/provision.d/`. No Rust/JVM/Emacs/Ansible/agents.
+- The `full` stage (built by `./build --full <runtime>`, the default) produces
+  `llm-in-a-box:<runtime>` **FROM** the slim image and runs every provisioning
+  step. Same contents as the pre-split image; the
+  steps moved into `docker/provision.d/` (single definition of "installed").
+- `./build all` builds both, slim first (the parent-image dependency, not a
+  build cache — works with `--no-cache`). `./build --slim all` = slim only;
+  `./build --full all` = full only (needs the slim image present).
+- Images carry `llm-in-a-box.provision=full|core` (and
+  `llm-in-a-box.built-at`), written by `./build`. `lbx` reads the label;
+  containers get the same label, so `--list` has a `MODE` column (vm rows read
+  the base disk's `bases/<ts>/provision`).
+- Launch selection: `--slim` / `--full`, else config `mode`
+  (`full` default | `slim` | `auto` = slim when a slim image exists), else
+  `full`. Every launch prints the resolved image and mode. `--print-images
+  --slim` prints the slim refs (build parity).
+- `--run` refuses a `core` image (run boxes have no sudo/inner docker and
+  cannot provision); `--slim`/`--full` are refused with `--run`.
+- vm base disks are per mode (`bases/<ts>/provision`; pre-stamp bases are
+  full); `resolve_base` picks the newest base of the requested mode, so a
+  slim session never boots a fat base.
 
 ## Network access control (netwall)
 
